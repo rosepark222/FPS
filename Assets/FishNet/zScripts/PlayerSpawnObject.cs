@@ -7,6 +7,7 @@ public class PlayerSpawnObject : NetworkBehaviour
 {
     public GameObject objToSpawn;
     [HideInInspector] public GameObject spwanedObject;
+    public float bulletSpeed = 10f;
 
     public override void OnStartClient()
     {
@@ -40,6 +41,8 @@ public class PlayerSpawnObject : NetworkBehaviour
     public void SpawnObject(GameObject obj, Transform player, PlayerSpawnObject script)
     {
         GameObject spawned = Instantiate(obj, player.position + player.forward, Quaternion.identity);
+        spawned.GetComponent<Rigidbody>().velocity = player.forward * bulletSpeed;
+        
         ServerManager.Spawn(spawned);
         SetSpawnedObject(spawned, script);
     }
