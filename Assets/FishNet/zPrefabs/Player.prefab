@@ -137,7 +137,7 @@ Transform:
   m_GameObject: {fileID: 4274614730560673737}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 433.74802, y: 215.742, z: 1.381}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -206,11 +206,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 7dc468100b5114a10a06934c2a7ce517, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _componentIndexCache: 2
+  _componentIndexCache: 1
   _addedNetworkObject: {fileID: 6684939750204944802}
   _networkObjectCache: {fileID: 6684939750204944802}
   objToSpawn: {fileID: 2835430348298332976, guid: 766b8b097e7e649bbbd4cdee9ed6b89d, type: 3}
   spwanedObject: {fileID: 0}
+  bulletSpeed: 10
+  playerCamera: {fileID: 0}
+  shootDirection: {x: 0, y: 0, z: 0}
+  cameraForward: {x: 0, y: 0, z: 0}
+  shootinfo: {fileID: 0}
 --- !u!114 &6684939750204944802
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -228,8 +233,8 @@ MonoBehaviour:
   <PredictedSpawn>k__BackingField: {fileID: 0}
   _networkBehaviours:
   - {fileID: 9169074500463388428}
-  - {fileID: 6099880522446348955}
   - {fileID: -3824897184661365210}
+  - {fileID: 6099880522446348955}
   <ParentNetworkObject>k__BackingField: {fileID: 0}
   <ChildNetworkObjects>k__BackingField: []
   SerializedTransformProperties:
@@ -258,7 +263,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a2836e36774ca1c4bbbee976e17b649c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _componentIndexCache: 1
+  _componentIndexCache: 2
   _addedNetworkObject: {fileID: 6684939750204944802}
   _networkObjectCache: {fileID: 6684939750204944802}
   _componentConfiguration: 0
