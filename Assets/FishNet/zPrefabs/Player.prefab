@@ -123,7 +123,7 @@ GameObject:
   - component: {fileID: 6099880522446348955}
   m_Layer: 0
   m_Name: Player
-  m_TagString: Untagged
+  m_TagString: Player
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
@@ -215,7 +215,7 @@ MonoBehaviour:
   playerCamera: {fileID: 0}
   shootDirection: {x: 0, y: 0, z: 0}
   cameraForward: {x: 0, y: 0, z: 0}
-  shootinfo: {fileID: 0}
+  sinfo: {fileID: 0}
 --- !u!114 &6684939750204944802
 MonoBehaviour:
   m_ObjectHideFlags: 0

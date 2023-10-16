@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using FishNet.Object;
+using UnityEngine.UI;
 
 public class PlayerSpawnObject : NetworkBehaviour
 {
@@ -11,7 +12,13 @@ public class PlayerSpawnObject : NetworkBehaviour
     [SerializeField] Camera playerCamera;
     [SerializeField] Vector3 shootDirection;
     [SerializeField] Vector3 cameraForward;
-//    public ShootingInfo shootinfo;
+    //public Text shootinfo;
+    public ShootingInfo sinfo;
+
+    // https://youtu.be/swIM2z6Foxk?si=kLkuSVKODDR8L0mU&t=5569
+    // The Ultimate Multiplayer Tutorial for Unity - Netcode for GameObjects
+    //  by samyam
+    public static event System.Action<Vector3> ChangedLengthEvent;
 
     public override void OnStartClient()
     {
@@ -19,7 +26,8 @@ public class PlayerSpawnObject : NetworkBehaviour
         if (!base.IsOwner)
             GetComponent<PlayerSpawnObject>().enabled = false;
 
-        
+
+        //sinfo = new ShootingInfo();
 
     }
 
@@ -31,8 +39,16 @@ public class PlayerSpawnObject : NetworkBehaviour
             cameraForward = Camera.main.transform.forward.normalized;
             shootDirection = cameraForward;
             Debug.Log(string.Format("1.7 shoot direction {0} {1} {2}", shootDirection.x, shootDirection.y, shootDirection.z));
-//            shootinfo.direction = shootDirection;
-//            shootinfo.UpdateScore();
+
+
+            //sinfo = GetComponent<ShootingInfo>();
+            //            sinfo.direction = shootDirection;
+            //            sinfo.UpdateScore();
+
+            // if anything is listening, invoke the function
+            ChangedLengthEvent?.Invoke(shootDirection);
+
+            //shootinfo.text = string.Format(" shoot {0}, {1}, {2}", shootDirection.x, shootDirection.y, shootDirection.z);
             SpawnObject(objToSpawn, transform, this, shootDirection);
         }
         if (spwanedObject != null && Input.GetMouseButtonDown(1)) // Input.GetKeyDown(KeyCode.Alpha2)) //Input.GetMouseButtonDown(1))
@@ -45,7 +61,7 @@ public class PlayerSpawnObject : NetworkBehaviour
     [ServerRpc]
     public void SpawnObject(GameObject obj, Transform player, PlayerSpawnObject script, Vector3 shootDirection)
     {
-        Vector3 ballPosition = player.position + player.forward;
+        Vector3 ballPosition = player.position + 2*player.forward;
 
         GameObject spawned = Instantiate(obj, ballPosition, Quaternion.identity);
         //spawned.GetComponent<Rigidbody>().velocity = playerCamera.transform.forward * bulletSpeed;

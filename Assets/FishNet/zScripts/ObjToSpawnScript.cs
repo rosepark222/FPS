@@ -13,8 +13,9 @@ public class ObjToSpawnScript : NetworkBehaviour
     [SerializeField]  public Vector3 initialPosition;
     [SerializeField]  public Vector3 moveDirection; // = Vector3.zero;
     [SerializeField]   Vector3 forward;
-    [SerializeField] float bulletSpeed = 30f;
- 
+    [SerializeField] float bulletSpeed = 60f;
+    public static event System.Action<int> ChangeScoreEvent;
+
 
     private Camera playerCameraForward;
 
@@ -123,8 +124,30 @@ public class ObjToSpawnScript : NetworkBehaviour
 
     private void OnTriggerEnter(Collider other)
     {
-        Debug.Log(string.Format("ball collides to {0}", other.gameObject.name));
         //Destroy(gameObject);
 
+        // CS0070: The event 'PlayerSpawnObject.ChangedLengthEvent' can only appear on the left hand side of += or -= (except when used from within the type 'PlayerSpawnObject')
+        // PlayerSpawnObject.ChangedLengthEvent?.Invoke(transform.position);
+
+        Debug.Log(string.Format("ball collides to {0}, {1}", other.gameObject.name, other.gameObject.tag));
+        if (other.gameObject.CompareTag("structure"))
+        {
+
+            ChangeScoreEvent?.Invoke(1);
+            DespawnObject(objToSpawn);
+
+        }
+        else if (other.gameObject.CompareTag("Player")) // enemy hit
+        {
+            Debug.Log(string.Format("ball collides to enemy {0}, {1}", other.gameObject.name, other.gameObject.tag));
+            ChangeScoreEvent?.Invoke(10);
+            DespawnObject(objToSpawn);
+        }
+    }
+
+    [ServerRpc(RequireOwnership = true)]
+    public void DespawnObject(GameObject obj)
+    {
+        ServerManager.Despawn(obj);
     }
 }
