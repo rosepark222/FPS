@@ -57,6 +57,11 @@ public class PlayerSpawnObject : NetworkBehaviour
         }
 
     }
+    [ContextMenu("shoot-bam-bam")]
+    public void printsomething()
+    {
+        Debug.Log("shoot");
+    }
 
     [ServerRpc]
     public void SpawnObject(GameObject obj, Transform player, PlayerSpawnObject script, Vector3 shootDirection)
