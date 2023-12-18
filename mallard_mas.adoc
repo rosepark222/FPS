@@ -1,0 +1,3102 @@
+:project-name: Mallard
+:imagesdir: ../assets/images/mallard
+= {project-name} Micro-Architecture Specification
+Josh Smith <jsmith@sifive.com>; Mohit Wani <mohitwani@sifive.com>; John Ingalls <john.ingalls@sifive.com>; Monika Tkaczyk <monika.tkaczyk@sifive.com>
+v0.5, {localdate}
+:toc:
+:toclevels: 5
+//:xrefstyle: full
+:sectnums:
+
+== Revision History
+[cols="1,3", options="header"]
+|===
+|Version    | Notes
+|0.1        | Initial check-in of content
+|0.2        | Describe new IFU and predictors. Updates to various sections
+|===
+
+<<<
+== Glossary
+[cols="1,3", options="header"]
+|===
+| Term    | Definition
+| AGU     | Address Generation Unit
+| ALU     | Arithmetic / Logic Unit
+| AR      | Architectural Register
+| BDP     | Branch Direction Predictor
+| CSR     | Control/Status Register
+| D-Cache | Data Cache
+| DFN     | Data Forwarding Network
+| DIS     | Dispatch stage
+| DTLB    | Data Translation Lookaside Buffer
+| ECC     | Error Correcting Codes
+| EX      | Execute stage
+| FEX     | Floating point Execution unit
+| FRF     | Floating point Physical Register File
+| GPR     | General Purpose Register
+| I-Cache | Instruction Cache
+| ID      | Instruction Decode stage
+| IEX     | Integer Execution unit
+| IJTP    | Indirect Jump Target Predictor
+| IRF     | Integer Physical Register File
+| ISS     | Issue stage
+| ITLB    | Instruction Translation Lookaside Buffer
+| LSU     | Load/Store Unit
+| MSHR    | Miss Status Handling Register
+| NLP     | Next Line Predictor
+| PC      | Program Counter
+| PCMT    | PC Map Table
+| PIPT    | Physically indexed, physically tagged
+| PMP     | Physical Memory Protection
+| PPN     | Physical Page Number
+| PR      | Physical Register
+| PRF     | Physical Register File
+| PTW     | Page Table Walker
+| RAM     | Random Access Memory
+| RAS     | Return Address Stack
+| RDU     | Rename-Dispatch Unit
+| REN     | Rename stage
+| RHF     | Rename History File
+| ROB     | Reorder Buffer
+| RR      | Register Read stage
+| RRT     | Register Reference Tracker
+| SRAM    | Static Random Access Memory
+| TLB     | Translation Lookaside Buffer
+| VPN     | Virtual Page Number
+| WB      | Writeback stage
+|===
+
+<<<
+== Project Overview
+{project-name} is a core generator for high-performance Out-of-Order execution micro-architectures.
+
+.LNER Class A4 4468 Mallard
+image::Mallard locomotive.jpg[]
+
+=== Features
+Below is a list of the major features of {project-name}:
+
+* RV64IMAFDC ISA support
+* Support for Machine, Supervisor, and User privilege modes
+* Instruction and Data caches of configurable size
+* Advanced branch prediction with configurable structure sizes
+* Advanced misspeculation recovery mechanism
+* Configurable fetch, rename, and dispatch width
+* Configurable number and organization of execution pipelines
+* ECC-protected SRAM memories
+
+<<<
+== Core Pipeline
+The main pipeline stages of the {project-name} core are illustrated below in <<BasicPipeline>>.
+Normal single-cycle ALU instructions will flow through the pipeline from stage 1 (F1) to
+stage 10 (WB).  Load and store instructions flow through a longer pipeline that is expanded
+out to 13 stages.  Divide instructions are handled by an un-pipelined iterative hardware divider.
+Multiply instructions flow through a slightly longer pipeline as well.
+
+[#BasicPipeline]
+.{project-name} Basic Pipeline
+image::mallard_pipeline.png[]
+
+.Pipeline Stages
+[options="header"]
+[cols="1,3"]
+|===
+|Abbreviation | Description
+|F1           | Fetch stage 1
+|F2           | Fetch stage 2
+|F3           | Fetch stage 3
+|ID           | Instruction Decode
+|REN          | Rename
+|DIS          | Dispatch
+|ISS          | Issue
+|RR           | Register Read
+|EX           | Execute
+|AG           | Address Generation
+|WB           | Writeback
+|LSTA         | LS Tag Address
+|LSTR         | LS Tag Read
+|LSTM         | LS Tag Match
+|LSTO         | LS Tag Order
+|LSTC         | LS Tag Confirm
+|LSTF         | LS Tag Flush
+|LDR          | Load Data Read
+|LDF          | Load Data Forward
+|LDWB         | Load Data Writeback
+|FLDWB        | Floating Point Load Data Writeback
+|LDCF         | Load Data Confirm/Flush
+|LDWR         | L1 Data Write
+|===
+
+.Major Core Units
+The major units within the core are as follows:
+
+* <<Instruction Fetch Unit>>
+* <<Rename and Dispatch>>
+* <<Integer Execution Unit>>
+* <<Load/Store Unit>>
+* <<Floating Point Execution Unit>>
+* <<System Unit>>
+
+
+<<<
+== Instruction Fetch Unit
+The instruction fetch unit is responsible for fetching instructions from memory, and delivering
+them to the decoders for eventual execution. The fetch unit consists of several sub-units
+listed below, and a pipeline diagram is shown in <<FrontendPipeline>>.
+
+.Frontend Main Structures
+* ITLB
+* I-Cache
+* Branch Predictors
+* Fetch Queue and Instruction Queue
+* I-Cache Miss Queue and Prefetch Queue
+
+=== Fetch Pipeline
+[#FrontendPipeline]
+.{project-name} Instruction Fetch Unit Pipeline
+image::frontend.png[]
+
+The main operations in each of the fetch stages is as follows:
+
+* F0: Determine the next PC from among the next sequential or flush/redirect targets.
+* F1: Lookup the L1 ITLB to translate the virtual PC to a physical address and check permissions. Lookup
+the I-Cache Way Predictor, and Next Line Predictor.
+* F2: Read the I-Cache Tag and I-Cache Data arrays, the Branch Direction Predictor arrays, and detect TLB and I-Cache misses.
+* F3: Detect Way Predictor mispredictions, enqueue I-Cache miss requests into the Miss Queue, align instructions
+read out of the I-Cache Data Array and write to the Fetch Queue, detect branch and jump instructions and
+NLP mispredictions, and redirect in the event of an NLP misprediction.
+* F4: Redirect for JALR indirect jumps which are not returns. Push JALR target into Fetch Target Queue.
+
+The detailed organization and operation of each structure can be found in the sections below.
+
+==== Multiple Cache Line Fetching
+The IFU supports limited ability to fetch from two sequential cache lines. In this description the older line is
+referred to as the base line and the younger line is referred to as the cross line. A cross line fetch is initiated if 
+the starting VA of a fetch group in F0 is past an offset IFUParams::fetchBytes before the end of the cache line and
+no blocking conditions exist.
+
+.{project-name} Cross Cache Line Fetching
+image::ifu_cross_fetch.png[]
+
+A cross line fetch will not occur if either a blocking event occurs in F0 or a truncate event occurs in F1. An F1
+truncate merely replays the cross line from the F1 stage. As this is functionally equivalent to fetching the two lines
+individually, the primary cost of speculatively assuming a cross line fetch in F0 is power consumption. The situations
+which trigger these described in the following table.
+[options="header"]
+[cols="1,3"]
+.Cross Line Fetch Inhibit Conditions
+|===
+|Stage | Condition
+|F0    | Disabled via disableCrossFetch chicken bit
+|F0    | Predictor update in RD or MD stage
+|F0    | Cross line way prediction miss in F3
+|F1    | Cross line is across minimum page size
+|F1    | Cross line way prediction miss in F1
+|F1    | Both IJTP hint bits set and cross fetch active
+|===
+
+==== Fetch Queue
+After fetching instruction data from the L1 I-Cache, the instruction data is aligned and written
+along with some other information to the Fetch Queue at the end of F3 stage. The group of instructions
+fetched in the same request to the L1 I-Cache are referred to as a fetch group. The Fetch Queue will
+buffer fetch groups and allow the fetch unit to run ahead in the presence of stalls later in the pipeline.
+The Fetch Queue will be completely invalidated on any pipeline flush from the branch unit or ROB.
+
+The oldest fetch group will be read out of the Fetch Queue and fed into logic which detects instruction
+boundaries.  Up to 5 individual instructions (RVC or RVI) are then consumed from
+the fetch group and written to the Instruction Queue. If the fetch group contains more than 5
+instructions, or more instructions than the Instruction Queue has space for, then the
+remaining instructions will be consumed in a later cycle.
+
+If the Fetch Queue is empty, the fetch group in F3 may bypass directly to the consumption logic for
+writing to the Instruction Queue.
+If the bypassing fetch group is not completely consumed, the remaining instructions will be consumed
+from the Fetch Queue. If the fetch group is completely consumed during bypass, it will still be written
+to the Fetch Queue, but immediately dequeued without generating duplicate instructions.
+
+.Fetch Group Data
+Besides instruction opcodes, the data written to the Fetch Queue includes:
+
+* The starting PC of the fetch group
+* Exception or replay flags in case TLB exceptions, ECC errors, or replay conditions occurred
+* Branch prediction information for this fetch group
+* Bit masks indicating which instruction data is valid, and where instruction boundaries are
+
+[[section-fetch-target-queue]]
+==== Fetch Target Queue
+The Fetch Target Queue sits alongside the Fetch Queue, but stores prediction information and
+targets for JALR instructions.  These predicted targets are dequeued by the RDU in ID stage,
+and get passed down the pipeline for allocation into the PCMT and comparison in the branch
+unit for determining whether the target was mispredicted.  The Fetch Target Queue has a few more
+entries than the Fetch Queue to account for JALR instructions which are in the Instruction Queue.
+
+[options="header"]
+[cols="1,3"]
+.FTQ Entry Contents
+|===
+|Field     | Description
+|provider  | Index of provider table in IJTP
+|ctrs      | Counter bits from tables in IJTP
+|target    | Predicted target of JALR
+|===
+
+The target field is used by all JALR instructions, even function returns predicted by the RAS.
+The provider and ctrs fields are only used later by JALR instructions predicted by the IJTP,
+and are used for the IJTP update policy.
+
+[[section-instruction-queue]]
+==== Instruction Queue
+The Instruction Queue buffers up un-decoded individual instructions, along with the PC,
+prediction information, and exception and replay flags.  Up to 5 instructions are written to the
+queue from the expansion and decoding logic.  Instructions are dequeued into ID stage flops,
+up to the rename width per cycle.  If the Instruction Queue has fewer valid instructions than
+the rename width, then instructions being consumed from the fetch queue may bypass the Instruction
+Queue directly into the ID stage flops. Instructions in F3 stage may bypass both the Fetch Queue
+and the Instruction Queue if both bypassing conditions are met. The Instruction Queue will be
+completely invalidated on any pipeline flush from the branch unit or ROB.
+
+There are some restrictions regarding whether certain instructions may be in the same
+rename group, and how many instructions may be in the group.
+The IFU has logic to detect these cases, and will only dequeue as many instructions that
+meet the restrictions.  The restrictions are as follows:
+
+* While in single step mode, only one instruction can be dequeued
+* At most one JALR instruction can be in a decode group
+* If the disableSuperscalar chicken bit is set, only dequeue one instruction per cycle
+
+The instruction queue and fetch queue have precise JALR detection but the F3 stage will not have instruction alignment
+information available in time. Instead a number of valid parcels, up to twice the IFUParams::nRename parameter, are
+scanned to detect possible RVI or RVC JALR decoding, without regard to instruction alignment. This includes a possible
+RVI starting from a previous cycle, stored in the partialBits_F3 register, but excludes an RVI starting at the very last
+parcel as this would not be sent to decode.
+
+.{project-name} F3 JALR Detection
+image::ifu_jalr_detection.png[alt=JALR_Detector,width=320]
+
+The action taken when multiple JALR instructions are detected depends on which structure they are present in. When
+fetching from the fetch queue or instruction queue fetching will stop right before the second JALR instruction. When
+fetching from F3 and the instruction queue the entire F3 stage won't be used for that fetch if
+multiple JALRs are detected. The table below summarizes the various cases of JALR instructions in each structure.
+
+[options="header"]
+[cols="1,1,1,4"]
+.Decode Stage JALR Impact
+|===
+| F3 | FQ | IQ | Action
+| 2+ | -  | -  | First JALR will be taken branch, flushing the remaining instructions.
+| -  | 2+ | -  | Invalid. First JALR must be taken branch, ending the fetch group.
+| -  | -  | 2+ | Fetch stops before the second JALR.
+| 1+ | 1  | -  | Invalid. Cannot fetch from FQ and F3.
+| 1+ | -  | 1  | No instructions from F3 sent to decode.
+| -  | 1  | 1  | Fetch stops before the second JALR.
+|===
+
+==== Adaptor
+The adaptor handles instruction alignment for the purposes of writing into the instruction queue or the decode stage. There
+are two inputs, one from the F3 stage, called the bypass, and one from the fetch queue. All instructions are consumed
+from one source or the other, with the exception being a single parcel remainder stored in the adaptor. Note that the
+input width is generally significantly wider than the output and thus the adaptor may not consume all inputs in a single
+cycle.
+
+.{project-name} Adaptor Pipeline
+image::ifu_adaptor.png[alt=IFU_Adaptor,width=640]
+
+Each instruction source has a dedicated pipeline where various metadata is extracted and initial alignment is done to
+account for any remainder from a prior fetch group. This information is then used to compute the start of each
+instruction, the appropriate per-instruction control signals such as exception and branch information, and align them to each
+instruction lane for that input. The final step is to mux between the two source inputs. If all lanes are not consumed,
+the partial_taken_mask register is updated with the remaining parcels to consume next. This will always be done from the
+fetch queue as any fetch group in F3 not completely consumed that cycle is written there.
+
+The remainder parcel primarily exists to support generating a complete RVI as the first instruction. To do this the
+first half must be carried over from prior processing in the adaptor to join it with the second. However the adaptor
+will also use the remainder to carry over any single RVC instruction if that instruction is the last of a fetch group.
+This avoids occupying a full fetch queue entry for a single RVC instruction.
+
+=== L1 ITLB
+The L1 ITLB is a structure used to cache virtual-to-physical address translations. The
+L1 ITLB is organized the same as the open-source Rocket ITLB.
+
+==== ITLB Miss Handling
+An ITLB miss is detected in F2 stage, and will both generate a request to the Page Table Walker (PTW) and
+redirect the fetch pipeline back to the address of the miss.  The fetch unit will then stall until either
+the PTW returns a translation or an older redirect or pipeline flush occurs.
+
+Upon receiving a response from the PTW, the data will be written to the way specified by the
+replacement policy, and fetch will resume if it was waiting for the response.
+
+==== ITLB Fault Handling
+Upon detection of an ITLB access fault, the fetch payload will be marked as poisoned.  The poisoned
+instruction will be sent down the pipeline, but will not update any architectural state. When the instruction
+becomes the oldest in the pipeline, a trap will be taken.  The mechanism for taking an exception in
+general is detailed in <<Exceptions>>.
+
+Because the C extension for compressed instructions is supported, it is possible that a 32bit instruction
+straddles two different pages.  In this case, it is possible that accessing the first half of the instruction
+may generate a fault, or accessing the second half may generate a fault.  If either half of the instruction
+generates a fault, an exception is signaled and a trap will be taken.
+
+TODO: List all the faulting cases?
+
+==== ITLB Synchronization
+If an SFENCE.VMA instruction is executed while an ITLB miss is outstanding, the miss will
+be marked as poisoned and not filled into the ITLB when the PTW response returns.  The core will resume
+fetching, miss the ITLB again, and then perform another PTW request.
+
+Note that the SFENCE.VMA includes an implicit barrier, meaning that the pipeline needs to be flushed
+in case the instruction stream is accessing pages which are being invalidated.  To avoid needing to
+precisely track which pages were accessed speculatively, the pipeline is flushed after SFENCE.VMA
+instructions.
+
+==== ITLB Port Arbitration
+Because the ITLB has a single lookup port, and there are multiple cases which require accessing the ITLB,
+arbitration is necessary.  The following operations require reading the ITLB:
+
+* A fetch or prefetch request needs to read the ITLB
+* An SFENCE.VMA instruction potentially needs to read the ITLB.
+
+The SFENCE.VMA instruction statically receives highest priority, because it is associated with
+an older instruction in the pipeline.
+
+=== L1 I-Cache
+The L1 I-Cache is a set-associative cache for instruction memory.  To avoid the long latency of reading
+the Tag Array and Data Array in series, and the high power of reading the arrays in parallel, a way predictor
+is used.  The Way Predictor is accessed in the F1 stage and the hit way is encoded into the read index
+of the Data Array.  The Tag Array is accessed in F2 stage and is only used for verifying the Way Predictor.
+The Data array is accessed in F2 stage, and in F3 stage the instructions are aligned.  The tag array has two banks
+so that the current and next line may be looked up in parallel.
+
+The I-Cache is not kept coherent with the D-Cache. Any updates to instruction memory must be synchronized with
+a FENCE.I instruction which will have the effect of invalidating the entire cache.  As a result, the latest
+contents of memory will be re-filled into the I-Cache if the fetch stream re-visits those addresses.
+
+==== I-Cache Way Predictor
+The Way Predictor is an array which contains one entry per cache block in the I-Cache.  Instead of storing the
+physical address tag like the Tag Array, the Way predictor instead stores a hash of the virtual address.  This
+allows us to make a prediction about which way will hit without having the translate the virtual address first.
+The Way Predictor is physically implemented as an SRAM and is indexed by cache line.
+
+.Way Predictor Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field         | Description
+|valid         | Valid bit for entry
+|ijtp          | JALR is likely in this block
+|vaHash        | VA Hash for this block
+|crossWay      | Expected way for following block
+|crossIJTP     | JALR is likely in following block
+|===
+
+The Way Predictor is read in F1 stage, and all ways are compared against the hash of the current PC.  The hit
+vector is then encoded into an index, which is used to generate the lower bits of the read index for the Data
+Array.  This means that we will read at most one way from the Data Array per access.  This path from reading
+the Way Predictor, to the comparison and index generation, to the Data Array read index is expected to be
+one of the most timing critical paths in the Fetch Unit.
+
+Cross line fetching is facilitated by replicating the way and IJTP bits in a prior entry. Banking the way predictor 
+would require computing the next VA, a 12-bit addition after F0 muxing. Rather than introduce significant timing 
+pressure on this path, the _next_ valid, way and IJTP bit are provided for each access. Way prediction misses for the
+cross line are handled independently of the base line if the base line hits.
+
+The hit way is passed down to the F2 and F3 stages.  In F3 stage the predicted hit way is compared against
+the hit way from the Tag Array.  In the event of a mismatch, a misprediction is signaled and the frontend
+is redirected to re-fetch the same fetch group again.  The Way Predictor will then be corrected according to
+the way hit information from the Tag Array.  Since the Way Predictor is single-ported, fetch is stalled for
+a single cycle to allow for this update.  The accuracy of the way predictor is expected to be very high, so
+this single cycle penalty is not expected to degrade performance much.
+
+The way predictor is initialized after reset, writing 0 to all fields. When a fill occurs the way predictor is updated 
+with the way for that cache line. For the cross line data the IJTP bit is always cleared but the cross way can usually
+capture the next line way information from the prefetcher. For the cases this is not available it will write way 0 for 
+the cross line.
+
+.Way Misprediction Events
+[options="header"]
+[cols="1,1,1,3"]
+|===
+|Base Line    | Cross Line | Replay           | Update
+|Miss         | Miss       | All F3           | Base line if tag array hits.
+|Miss         | Hit        | All F3           | Base line
+|Hit          | Miss       | Cross line only  | Set crossWay, clear crossIJTP
+|Hit          | Hit        | None             | None
+|===
+
+==== I-Cache Tag Array
+The I-Cache Tag Array contains one entry per cache block in the I-Cache.
+The array stores the Physical Page Number tag of the cacheline that was filled into that entry of the cache.
+The array is physically implemented as two banked SRAMs and is parity-protected on the granularity of
+one entry.
+
+.Tag Array Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field         | Description
+|corrupt       | Bus response indicated corrupt
+|tag           | Physical tag
+|===
+
+The valid bits associated with the I-Cache Tag Array are implemented in flops outside of the SRAM.  This
+allows for quick single-cycle clearing of all valid bits at reset, and when executing a FENCE.I instruction.
+
+The two banks are organized to interleave even and odd cache lines. Thus a cross line lookup where the base line
+accesses the even bank uses the same index for both banks. Where the lookup base line is odd, the even bank uses an N+1 
+index. During single line fetches only one bank is activated.
+
+The Tag Array read and tag comparison occur in the F2 stage, and the hit information is staged into F3.
+In F3 stage, a frontend redirect will occur upon a tag miss and a miss request will be enqueued into the
+Miss Queue.  The fetch unit will then stall for the line to be filled, or until an older redirect or
+pipeline flush occurs.
+
+.Corrupt Indication
+The TileLink bus response contains a corrupt bit.  This corrupt bit is written into the Tag Array on a fill.
+If a later fetch reads from that cache block, then a TLB access exception is signaled on any instructions
+from that fetch group.
+
+==== I-Cache Data Array
+The I-Cache Data Array contains one entry per cache block in the I-Cache.  The array stores the actual data from
+memory to be interpreted as instruction opcodes.  The array is physically implemented with SRAMs and is
+parity-protected.  The array is also banked so that we can control the read enables more precisely
+to reduce power.  The banking granularity is chosen to trade-off between reducing read power and getting a
+desirable SRAM bank size and aspect ratio. Each bank has one parity bit.
+
+The interface to the Data Array is a single cache block wide, so that a fill into the Data Array only requires
+a single cycle.  The fetch unit will be stalled while a fill happens, and this reduces the number of
+stall cycles.  This is not an issue if the fetch unit is still stalled waiting for that line, but an older
+redirect or flush may have re-steered the fetch unit or the fill may have been from a prefetch request.
+
+The Data Array is read in the F2 stage of the pipeline, and at the end of F2 stage the cache data will be
+muxed down to 32B.  In the F3 stage the 32B data is rotated to get up to 16B of aligned data.  The
+Fetch Unit will not cross a 32B boundary within one cycle.  The rotated instruction data will be
+written to the <<Fetch Queue>>.
+
+==== I-Cache Miss Handling
+Upon detection of a cache miss, a request is sent to the Miss Queue, and then a configurable number
+of sequential cache block addresses will be enqueued into the Prefetch Queue.  The first miss which the
+fetch unit is stalled waiting for is referred to as the demand miss. If a cross line fetch results in a miss in F3
+only the oldest line is considered the demand miss. It is expected in most cases that the prefetcher will request the 
+cross line if both lines miss in the cache.
+
+While the fetch unit is stalled, addresses will be dequeued from the Prefetch Queue and
+the fetch unit will look these addresses up in the Tag Array.  If we miss the Tag Array, these prefetch
+requests are also sent to the Miss Queue.
+
+.Miss Queue
+The Miss Queue has a configurable number of entries, one per cache block requested, with the state described
+below.  If the Miss Queue is full while the fetch pipeline detects another miss, fetch pipeline will
+simply redirect and try again when an entry becomes available.  A prefetch request will not be allowed
+to allocate the last entry of the Miss Queue, in case a pipeline flush occurs which misses on another
+line.  We don't want to stall sending a demand miss request.
+
+.Miss Queue Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field         | Description
+|sent          | Request has been sent over the bus
+|blocking      | This is a demand miss blocking the fetch pipeline
+|poison        | An I-Cache invalidation occurred, do not fill into cache
+|prefetch      | This is a prefetch request
+|missVA        | Virtual Address of the cache block
+|missPA        | Physical Address of the cache block
+|parentValid   | Previously allocated miss request was valid when this entry allocated
+|parentFilled  | Previously allocated miss request already filled into cache
+|parent        | Index of previously allocated miss request
+|jalrCross     | 32-bit JALR instruction may cross into this line
+|===
+
+Each request sent to the Miss Queue will CAM any currently valid entries by physical address, to make
+sure that we don't generate duplicate bus requests for the same physical address.  In F2 stage the
+physical address from the TLB is compared against all valid entries, and in F3 stage a request will be
+enqueued only if no valid matches were seen.  If we did match a valid entry, the blocking bit will be set
+to indicate that the fetch unit is now stalled waiting for that block.  If a cross line fetch is active and both 
+lines have active fills then the blocking bit will be set only on the oldest line. If we match an entry which is
+currently in the process of filling, the fetch pipeline will just redirect and immediately try fetching
+again.
+
+Every cycle the Miss Queue scans for valid entries which are not marked as sent.  And if the bus is ready,
+a valid bus transaction occurs and the entry is marked as sent.  A valid request in F3 which did not hit
+an existing entry may bypass and generate a bus transaction in F3 stage if no currently valid entries are
+marked as unsent.
+
+Whenever a pipeline flush occurs, we will clear the blocking bits of all entries but will not invalidate
+any outstanding sent or unsent requests.
+
+.Fill Pipeline
+On the first beat of fill data returning over the bus, the source ID is examined to identify which Miss
+Queue entry is being filled.  The entry's data is muxed out and when the last beat returns the fill pipeline
+becomes active. The fill pipeline is mapped onto 2 pipeline stages, F0 and F1.
+
+* F0 stage: Valid when last beat of data returns from the bus. Way Predictor is updated.
+* F1 stage: Tag Array and Data Array are written.  If entry was poisoned, valid bit for that I-Cache entry
+is not set.
+
+Because the Way Predictor, Tag Array, and Data Arrays write accesses occur in the same stages that normal
+fetch reads occur, we only have to stall fetch for one cycle to perform the fill. A fill may be in F1 stage
+while a normal fetch request is in F0 stage.
+
+.IJTP Hint
+When supporting the C extension, it's possible for 32-bit JALR instructions to cross cachelines.  As a power
+optimization, the Way Predictor stores two bits indicating that a JALR instruction likely ends in this
+cacheline or the next. While fetching, the IJTP is only accessed if either hint bit is set.
+To generate the base line hint bit, the Miss Queue has some extra logic to scan incoming fill data
+and detect when JALR instructions may end in this cacheline.  The parentValid, parentFilled, parent, and
+jalrCross entry fields are used for this purpose. The cross line hint bit is never set on fills.
+
+The common case is that the fetch unit will generate a miss, and then a few sequential prefetches.
+When a Miss Queue entry is allocated, the Miss Queue will check to see if the previously allocated entry is
+still valid. If so the parentValid field is set to 1 and the parent field is set to the index of the previously
+allocated entry. The previously allocated entry is referred to as the "parent" entry.
+If the parent entry fills first, then the parentFilled field is set to one, and the jalrCross
+field is set to one if the last 16 bits of the parent fill data looks like the lower 16 bits of a 32-bit JALR.
+When the fill data for an entry comes back, each beat of fill data is also scanned for potential JALR instructions.
+This is tricky when supporting the C extension because it may not be possible to know if the first 16 bits of the
+cache block corresponds to the second half of a 32-bit instruction or not.  So we assume both cases.
+
+When an entry fills, the base line IJTP hint bit is set if any of the following cases is true:
+
+* When the miss request was made, the fetch pipeline already had the first 16-bits of an RVI instruction and
+it looks like a JALR
+* The parent entry was valid and filled first, and the jalrCross bit is set
+* When this entry's fill data was scanned, we might have a complete JALR instruction.
+
+In the F2 stage either IJTP hint bit could be set which corresponds to one of the following four actions:
+
+.Way Predictor IJTP Hint Cases
+[options="header"]
+[cols="1,3"]
+|===
+|IJTP Hint Case  | IJTP Access
+|Both Clear      | No IJTP lookup
+|Only Base Set   | Lookup with base line address
+|Only Cross Set  | Lookup with cross line address
+|Both Set        | Lookup with base address
+|===
+
+Rather than bank the IJTP, the input address is modified depending on where the expected branch is located. Some 
+interesting scenarios are described in the following figure which depicts two adjacent cache lines containing 3 indirect
+branches. The second branch is within _fetchParcels_(the cross line threshold) of the end of the base line and the third 
+branch is within _fetchParcels_ of the start of the cross cache line.
+
+.{project-name} IJTP Hint Bit Scenarios
+image::ijtp_hint_bits.png[]
+
+If the starting VA is outside the cross line threshold then a cross fetch is impossible and the IJTP lookup will occur
+using the base line if the base hint bit is set. This is depicted in case A. If the starting VA is after the cross line
+fetch threshold then a branch may be detected in either the base line or the cross line. In case B the starting VA is 
+before the second branch so the base hint needs to be set(case B.0) in order to capture the target address for that branch.
+In case C the starting VA is after the second branch but before the next cache line so the cross hint bit needs
+to be set(case C.1) to capture the target for the third branch. However if case B.0 is used, that is the base hint is
+set, then case C.0 fails because the base line VA will always be used irrespective of the starting VA. Likewise setting
+the cross hint bit in case C.1 causes case B.1 when fetching with the earlier offset and the second branch is missed.
+
+Rather than trying to track VA offsets in the way predictor, the logic avoids these cases by truncating any cross line
+fetch in F1 if both hint bits are set. This ensures both lines will be looked up independently and both cases of branches
+will be predicted by the IJTP. 
+
+Finally no IJTP lookup will occur for the cross line if it is not actually fetched, as shown in case D.
+
+There is logic in the fetch pipeline to detect whether either IJTP hint bit was wrong.  If either hint bit indicates
+that there is no JALR in the line, but the branch handling logic detects a JALR instruction, a
+misprediction is signaled.  The timing on this detection is currently pretty tight, and it's problematic
+to simply replay from F3 stage and kill the fetch group.  Instead, we send down a replay signal with the
+fetch group so that the ROB will trigger a replay.  The Way Predictor is also updated to set the hint bit.
+
+==== I-Cache Parity Errors
+The I-Cache Tag Array and Data Array both have parity protection. In the event that any
+error is detected, the fetch group will be enqueued into the fetch queue and passed down the pipeline
+with a replay indication.  At the same time, the I-Cache will be invalidated by flash-clearing the
+valid bits.  If the replay indication becomes non-speculative, it will cause a pipeline flush by the ROB
+and the fetch unit will re-fetch the address which saw the error. The only exception is if a cross cacheline fetch is 
+active when a parity error is detected, the base line will always be replayed. Since the entire I-Cache was flushed, the
+error cacheline will always be re-fetched and filled.
+
+==== Instruction Recoding
+
+To improve branch decode timing certain opcodes are translated before being written into the data array. The object
+InstructionRecoder has a function recode() that is applied to certain opcodes during cache fills. After the cache is 
+read the instructions are sent unchanged to the branch detectors. The function unrecode() is used to restore the 
+original opcodes before writing into the fetch queue or consumption by the adaptor.
+
+.{project-name} Instruction Recoding
+image::ifu_inst_recode.png[]
+
+=== Branch Prediction
+This section describes the various branch prediction structures in the Fetch Unit:
+
+* The Next Line Predictor (NLP) for providing a fast single-cycle direction and target prediction
+* The Branch Direction Predictor (BDP) for providing a more accurate direction prediction
+* The Indirect Jump Target Predictor (IJTP) for providing a target prediction for indirect jumps
+* The Return Address Stack (RAS) for predicting the target of function returns
+
+==== Next Line Predictor
+The Next Line Predictor is a fully-associative table which is searched in the F1 stage to provide
+a single-cycle prediction of direction and target for conditional branches and direct jumps. The current
+virtual fetch address (PC) is aligned to the size of the smallest supported instruction
+(2B with C extension, or 4B without), and a configurable number of bits are used to CAM against each
+valid entry in the NLP.  When a hit is detected, the entry is muxed out and the fetch pipeline will
+redirect to the predicted target.
+
+.NLP Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|tag        | Hash of VA used to search table
+|target     | Target address of branch or jump
+|end        | Which parcel in fetch group contains the branch or jump
+|branch     | Entry is a prediction for a conditional branch
+|call       | Entry is a prediction for a function call
+|===
+
+===== NLP RAS Forwarding
+Function returns normally get predicted in F3 stage when the instructions are decoded, and the RAS is used to
+predict the target.  To reduce the prediction latency on function returns, the NLP has a smaller
+number of specialized "RAS" entries that are used for predicting function returns in the F1 stage.
+The NLP RAS entries only contain the tag and end fields, because they are only trained by returns,
+and the target comes from the RAS itself.
+
+If a fetch group hits one of the NLP RAS entries, the predicted target will be forwarded either from
+the RAS, or from a fetch group in F2 which the NLP predicted as a function call.
+
+===== NLP Verification
+The NLP hit indication and entry are staged down to the F3 stage where branch and jump instructions are
+detected, and the BDP prediction result is available.  If the NLP prediction mismatches with the F3 prediction
+then a redirect will occur in F3 or F4 stage using the BDP prediction (for conditional branches), and the calculated
+target from the actual instruction opcode and fetch PC.  The NLP can mispredict in the following ways:
+
+* Direction: NLP hit, but conditional branch or jump was detected and predicted taken in F3. Or vice versa
+* Address: NLP hit, but for the wrong instruction. Meaning the end field or the branch field did not match
+the F3 prediction.
+* Type: NLP hit and a branch or jump was taken in F3, but the branch field was wrong
+* Target: NLP hit and a branch or jump was taken in F3, but the target was wrong
+
+Comparing the entire predicted target with the calculated target is a long timing path, so for better timing
+the comparison is split into two: checking the lower bits of the target, and checking the upper bits of the
+target.  On a target misprediction it is more likely that the lower bits will mismatch, so the lower check
+will cause a redirect in F3 stage.  A mismatch of the upper bits will redirect in F4 stage.
+
+===== NLP Training
+When an NLP misprediction is detected in F3 stage, the NLP will be trained in F4 stage with the prediction that
+was made in F3 stage (which is assumed to be more accurate). One of three operations will occur in F4 stage
+after an NLP misprediction is detected:
+
+* Invalidate: NLP hit but Direction misprediction
+* Allocate: NLP miss but Direction misprediction
+* Update: An NLP hit and but Type or Address misprediction
+
+An Invalidate operation will invalidate the entry that was hit in F1 stage.  An Allocate operation will install
+a new entry with the predicted information from F3 according to a Pseudo-LRU replacement policy. An Update
+operation will overwrite the hit entry with the new predicted information from F3.
+A function return will allocate one of the side NLP RAS entries instead of one of the main NLP entries.
+
+If an NLP hit occurs in F1 where the branch source is in the younger cache line, the hit is always followed, even if a 
+cross line fetch is not active in F1. Instead of blocking the NLP hit in F1 the redirection is allowed to occur and in
+the F3 stage the normal bad taken recovery occurs to fetch the sequential line. This is too avoid timing pressure on the
+NLP in F1. However in this case it is assumed the cross line would contain the NLP-predicted branch and so the associated
+invalidation in F4 is suppressed.
+
+Since most NLP mispredictions will cause a redirect in F3, but the NLP is trained in F4, there is write-to-read
+bypass logic for predictions in F1 occurring at the same time as training events in F4.  A bypass can either
+force an NLP hit to be a miss (if an Invalidate is happening), or a miss to be a hit (if an Allocate is
+happening).
+
+==== Branch Direction Predictor (BDP)
+The BDP is used for predicting the direction for conditional branch instructions.
+It is used as a second-level predictor after the NLP.  The BDP is a TAGE-style predictor with a base table
+and multiple tagged tables using successively more history bits for hashing.
+
+===== Branch History
+The BDP uses a global branch path history to predict future branch outcomes. All taken branches and jumps
+generate a signature that is an XOR function of a configurable number of bits of the branch PC and target.
+The signature is then added to the history by shifting out the oldest history bit and XOR’ing the signature
+into the most recent history.
+
+The most up to date history is stored in a circular buffer and used to address the BDP during prediction.
+This history is not sufficient to recover histories of older branches because every new branch that is predicted
+modifies a number of recent history bits with its signature. For this reason, the rewind history buffer is used
+to hold most recent history fragments for all branches that might be flushed or require training. The length of
+history that each rewind buffer entry must hold is one less than the length of the branch history signatures.
+The recent history from the rewind buffer is combined with older history from the common buffer to recreate the
+full history during pipeline flushes or BDP training.
+
+===== BDP Organization
+The BDP is SRAM-based, and to be more area efficient is designed to use only single-ported
+memories. This means that both predictions and updates share the same port.  The prediction pipeline takes
+priority over the update pipeline as the cost of not making predictions for a fetch group is likely much higher
+than delaying a predictor update.  When the prediction pipeline has a bubble (either due to frontend redirects
+or fetch stalls), the update pipeline is allowed to proceed.  The BDP is also split into two banks to reduce
+conflicts between the prediction and update pipeline, and to support reads across two cache lines.  A prediction and 
+update may proceed in parallel if they access different banks and no cross cacheline fetch is active.
+
+The base table of the BDP only stores counters in the form of a direction bit and hysteresis bits. The hysteresis
+bits may be shared among multiple adjacent entries for area reduction at the cost of more potential destructive
+aliasing.  There is one direction bit per 2B of instruction opcodes if C extension is implemented, or every
+4B if not.
+
+.BDP Base Table Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|p          | Predicted direction
+|h          | Hysteresis bits
+|===
+
+Compared to the base table the tagged tables of the BDP maintain three additional fields, for a total of five fields.
+The tag field is used to store a tagged hash value of the VA and history bits. The useful bit is used by the update
+logic and the pos bits for branch location. These are described in more detail below.
+
+.BDP Tagged Table Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|p          | Predicted direction
+|h          | Hysteresis bits
+|t          | Tag which is a hash of PC and history
+|u          | Useful bit
+|pos        | Position of branch within the fetch group
+|===
+
+====== BDP Table Access
+
+The base table is indexed with a hash function using a configurable number of address and history bits, including zero
+bits. The hash output width is set to the base table index width. Note the VA bits at and below the bank bit are not used
+for computing the base table index, but the bits below the bank bit are used to select a prediction for a particular
+parcel.
+
+.{project-name} BDP Base Table Hash Function
+image::bdp_base_hash.png[width=1024,height=768]
+
+The tagged tables are indexed using a different hash function than the base table. This function is instanced four times,
+the tag and index hash computation for both the BDP and IJTP. This description and the diagram are relative to the
+shared function inputs.
+
+.Common TAGE Tagged Hash Function
+[options="header"]
+[cols="1,2,3,3"]
+|===
+|Function Inputs | Description              | BDP Index          | BDP Tag
+|addr            | Virtual address        2+| Dynamic
+|addrBits        | Virtual address width  2+| BDPParams::addrBits - BDPParams::fetchUnits.log2 - BDPParams::banks.log2
+|hist            | History vector         2+| Dynamic
+|histLen         | History vector width   2+| TaggedTableParams::historyBits
+|n               | Function output width    | TaggedTableParams::indexBits-TaggedTableParams::banks | TaggedTableParams::tagBits
+|nXor            | Function logic depth     | BDPParams::nIdxXor | BDPParams::nTagXor
+|f               | XOR shift factor         | 2 * Table Index    | 2 * Table Index + 1
+|===
+
+Note there are two dynamic inputs with the remaining parameters set, directly or indirectly, using configuration options.
+The function allows the logic depth to be specified using the configuration parameter 'nXor' and the number of address
+bits using the parameter 'addrBits'. The consumed history bits are then computed based on these values and the output
+width parameter 'n'. If the 'histLen' parameter is larger than what is consumed to satisfy the nXor constraint, a
+sub-sampling mechanism is used to only select a specific number of evenly distributed bits from the history vector
+parameter 'hist'. The selected history bits 'h' are then prepended to the sampled 'addr' bits to form the input 'v' to
+the XOR operation. Each XOR stage rotates the input by a function of the stage index, the output width and the 'f'
+parameter. Note the rotate operation depends on the tagged table index.
+
+.{project-name} BDP Tagged Table Hash Function
+image::bdp_tagged_hash.png[]
+
+The base table will provide separate predictions for all instructions in the fetch group, while each tagged
+table will provide a single prediction for the fetch group.  This pos field of the tagged table entry identifies
+which branch the prediction applies to, and corresponds to the LSBs of the PC of the branch.
+
+To improve prediction accuracy, as well as reduce the amount of state that needs to be piped down for each
+conditional branch, the predicted counter values and hit information from each table is not stored for the
+later update.  Instead, we determine whether a conditional branch may need to update the predictor after
+resolving, and during update time the BDP is updated with a read-modify-write operation.  A conditional
+branch only needs to update the BDP if one of the two following conditions are met:
+
+* The direction is mispredicted
+* The direction is predicted correctly, but the counter is not saturated or the U bit needs to be set.
+
+The U bit is set in the case where a tagged table makes a correct prediction, and the alternate prediction (the
+prediction that would have been made if that tagged table did not hit) was incorrect. This is a mechanism to
+detect when entries are useful and should not be replaced over.
+
+So for each conditional branch, we pass down the pipeline the predicted direction, whether the counter is saturated,
+and whether the U bit would need to be set if the branch is predicted correctly.
+
+===== BDP Prediction
+The BDP is SRAM-based and therefore takes multiple cycles to read and produce predictions. The prediction
+pipeline occurs over F1-F3 stages as follows:
+
+* F1: Hash the fetch PC and history to generate the indexes for each table
+* F2: Read all tables, and for tagged tables compute hits
+* F3: Provide final prediction for each instruction in the fetch group
+
+If a cross line fetch is active then both BDP banks are read in parallel. Like the tag array, the even and odd banks of
+the predictor are interleaved. When a cross line fetch occurs the younger bank always uses a cache line aligned address.
+
+In F2 the base table results from each bank are appended to create a prediction and a hysteresis vector across both
+cache lines. A shift operation is applied, split across the F2 and F3 stages, to align the two result vectors with the
+fetch virtual address. The final result signal 'baseResultsVec_F3' is a vector of objects for each parcel containing
+the predict/saturation/useful bits.
+
+Also in F2 several computations are done for all tagged tables for both banks. The 'pos' field is compared to the 
+corresponding VA for each parcel and the 'tag' field is compared against the hashed result of the VA and history bits.
+These results are ANDed and passed through a bank select mux before registering in taggedPredHitVec_F3. The other 3 
+tagged table fields, p/h/u, are directly registered in F3 for each table and bank in taggedRead_F3.
+
+In the F3 stage the final per-parcel results are computed from the three signal groups described above:
+baseResultsVec_F3, taggedRead_F3 and taggedTableHitVec_F3. Each parcel is computed independently of the other
+parcels. First the set of non-position tagged table results from taggedRead_F3 is selected based on if the parcel is
+from the cross line or not.
+
+The provider table is then selected using the highest indexed table in taggedPredHitVec_F3. If none have hit then the
+base table is used. In order to maintain the 'u' bits in the tagged tables the 'altpred' computation is also performed
+which computes the _next_ highest table index which indicates a hit. Note that the base table is always an implicit hit.
+
+The final three fields for each parcel are computed as follows. The prediction direction 'predTkn' is simply taken from the 
+provider table directly. The saturation 'sat' is computed by checking if the hysteresis bits are maxed from the selected 
+provider table. The update useful bit 'updateU' is slightly more complex as it must check if the altpred disagrees
+with the pred result. If this is true and the selected provider table does not already have the useful bit set then
+this bit is set for the parcel.
+
+.{project-name} BDP Prediction Lookup
+image::bdp_cross_line.png[]
+
+The prediction information for each branch will eventually get written to the <<Branch Resolution Queue>> for
+eventual predictor update, if necessary, and if the branch gets retired from the pipeline.
+
+===== BDP Update
+After conditional branches execute and resolve their true direction, the branch unit will update the BRQ with
+whether the branch was mispredicted or not.  When branches retire from the ROB, the ROB will inform the BRQ.
+If the BRQ determines that a predictor update is required, then the BRQ will eventually send a request to
+the BDP update pipeline.  The main operation of each stage in the update pipeline is as follows:
+
+* ST (Setup): Hash the PC and history to generate indexes for each table
+* RD (Read): Read all tables, and for tagged tables compute hits
+* MD (Modify): Compute predictor update and update tables if necessary
+
+Note that both ST and MD stages need to access the tables and will have to arbitrate with the prediction pipeline
+F1 stage.  It is possible that the BRQ sent an update request to the BDP because while the branch was predicted
+the prediction was incorrect or the counters were not saturated, but that while the branch was in-flight the
+prediction was updated by some older in-flight branch.  If in MD stage we determine that no update is required,
+the update will be dropped.
+
+Upon a correct prediction, the provider table (the table which provided the final prediction) is updated unless
+the counter is saturated and the U bit is already set or does not need to be set.
+
+Upon a misprediction, the provider table is always updated, and we attempt to allocate an entry for this branch
+in a higher tagged table (one using more history). The higher tagged tables are read in the RD stage, and
+starting from one table higher than the provider table we look for an entry without the U bit set. If a table
+does not have the U bit set we will allocate into that table. If all U bits are set, we will clear the U bit of
+the lowest indexed tagged table that is higher than the provider.
+
+.BDP Update Exceptions
+{project-name} has a feature to convert short forward branches over move instructions into a conditional
+move sequence.  In this case, the conditional branch will always try to train the BDP toward not-taken.
+See <<Conditional Move Conversion>> and <<Conditional Move Handling>> for more detail.
+
+===== BDP Power Widgets
+During periods when conditional branches exhibit relatively simple behavior, it's expected that most
+predictions will come from the base table and the first tagged table (table 0). To reduce dynamic power, the BDP
+has logic to detect when the upper tagged tables (tagged tables 1 through N-1) are not actively being used for
+prediction.  When certain conditions have been met, the BDP will stop reading the upper tagged tables (to save on
+the dynamic read power) until the next time a pipeline flush occurs.
+
+To detect when the upper tagged tables have not been used for a sufficiently long time, an 8-bit counter is used.
+Upon every fetch lookup of the BDP for prediction, we check to see if a one of the upper tagged tables generates
+a hit.  If no hit is generated, the counter is incremented.  If a hit is generated from the upper tables, or a
+global pipeline flush occurs (either from the ROB or from a branch execution unit), the counter is reset to 0.
+If the counter saturates, then the BDP will stop reading the upper tagged tables during both prediction and training.
+Upon the next pipeline flush, the counter will be reset to 0 and we will continue to read from the upper tagged tables
+again.
+
+This widget can be disabled by setting the disablePredSkip IFU chicken bit to '1'.
+
+==== Indirect Jump Target Predictor (IJTP)
+The IJTP is a structure used to predict the target of indirect JALR instructions.
+The encoding of the rs1 and rd fields of the JALR instruction provide hints as to
+the usage of the JALR as a function call or return.  The IJTP does not predict the targets of function
+returns, instead the <<Return Address Stack (RAS)>> is used.
+
+The IJTP is an ITTAGE-style predictor, which is similar in design to the BDP.  However, as opposed to predicting
+branch direction, the IJTP provides target addresses.
+
+===== IJTP Organization
+The IJTP is SRAM-based, and to be more area efficient is designed to use only single-ported
+memories. Unlike the BDP, there is no structural hazard between prediction and updates on the IJTP.
+This is described in more detail in <<IJTP Update>>.
+
+.IJTP High Array
+As an area optimization, we make use of the observation that it is likely the IJTP will only need to
+reference a small number of memory ranges within a given window of time.  The IJTP uses a level of
+indirection to compress the storage of the upper target virtual address bits. Each entry in the IJTP
+will therefore only keep a certain number of lower bits and a reference to a table containing the
+upper bits.  This table is referred to as the High Array.  The mechanism for allocating High Array
+entries is described in <<IJTP Update>>.
+
+.IJTP Table Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|hiIdx      | Index into High Array which stores upper target bits
+|tgtLow     | Low bits of target PC
+|tag        | Hashed tag (only for tagged tables)
+|===
+
+Each entry in the IJTP also has a counter (currently just 1 bit), which is used for indicating the
+usefulness of each entry and affects the replacement policy (similar to the U bit in the BDP).
+These counter bits are stored in flop arrays.
+
+===== IJTP Prediction
+The IJTP is SRAM-based and takes multiple cycles to produce a prediction. Since JALR instructions are much
+less common than conditional branches, as a power optimization the fetch pipeline only tries to read the IJTP
+when fetching from a cache block which is likely to contain a JALR.  The I-Cache Way Predictor provides two hint
+bits that indicates the base line or cross line likely has a JALR, and these hint bits are used to enable accesses to 
+the IJTP. 
+
+The prediction pipeline occurs over F1-F4 stages as follows:
+
+* F1: Read the IJTP hint bit from the Way Predictor
+* F2: Hash the PC and history to generate indexes for each table. Use hint bit to qualify read enables
+* F3: Read all tables, and for tagged tables compute hits. Fetch pipeline will detect JALR instructions.
+* F4: Provide single final predicted target for the fetch group.
+
+The index used to access the IJTP is always based on the base line VA, unless only the cross line hint bit is set and
+cross line fetching is active. In this case the cross line VA is used as the index because the next indirect branch is
+expected to be in the cross line.
+
+In F4 stage, the hiIdx field of the provider entry is used to read the upper target bits from the High Array.
+
+In F3 stage the branch detection logic will detect JALR instructions, and if there are no older predicted taken
+branches or jumps, will generate a late redirect indication.  In F4 stage, if a late redirect is signaled, the
+fetch unit will redirect to the predicted IJTP target.
+
+Unlike the BDP, the more IJTP prediction information is passed down the pipeline because we do not re-read the
+IJTP at update time.  So the single counter bit read from each table and the index of the table providing the
+final prediction (the provider table) will be passed down the pipeline and written into the BRQ.
+
+.IJTP Hint Misprediction
+When supporting the C extension, it is not possible to precisely determine when a cache block starts with the
+second half of a JALR instruction at the time of fill.  With multiple misses outstanding, fills may return
+out of order.  If the fetch pipeline detects a JALR instruction while searching for branches and jumps in F3,
+but the hint bit read out of the Way Predictor indicated no JALR instructions, then there was a misprediction.
+In this case the IJTP was not accessed and there is no valid prediction for that fetch group.  This is handled
+by treating this as a Way Predictor misprediction, setting the IJTP hint bit in the way predictor, and
+re-fetching.  This will incur a 4-cycle penalty, but is expected to be rare.
+
+The two hint bits are updated independantly and once set cannot be cleared unless the cache line is replaced. This can 
+incur a power penalty in the case of a cross line fetch because the cross line may be replaced without any update to
+the base line in the way predictor. However this scenario is expected to be rare. It is also possible for both hint bits
+to be set in which case cross line fetching will be disabled for that base line. This is because it is not possible to 
+determine if the base line JALR instruction is before or after the starting VA.
+
+Because this power optimization also has performance implications, it can be disabled by the <<Chicken Bits>>
+which will always write 1 to the base line IJTP hint field of the way predictor.
+
+===== IJTP Update
+To avoid needing to store the resolved target of each JALR in the BRQ, the IJTP is updated directly after
+the branch unit resolves the jump instead of at retirement.  When an IJTP jump issues to the branch unit,
+the BRQ index is sent back to the BRQ and the IJTP prediction information (the counter bits and provider table
+index) are read out of the BRQ.  When the JALR is in WB stage, an update
+request will be sent to the IJTP.  The update pipeline therefore is as follows:
+
+* ISS stage: Branch unit sends the BRQ index back to the BRQ
+* RR stage: IJTP prediction information is read from the BRQ
+* EX stage: IJTP update request is constructed and flopped into WB
+* WB stage: Send update request to IJTP along with misprediction indication. IJTP will re-compute table
+indices and tags. CAM High Array using upper target bits.
+
+If the IJTP gets an update for a correctly predicted jump, it will set the counter bit for the provider entry.
+If the target was mispredicted the IJTP will update the provider entry if the counter bit was zero, or decrement
+the counter bit if not. The IJTP will also attempt to allocate into a higher table than the provider
+table.  Starting from the next highest-indexed table, the counter bits are scanned. If a table has a counter
+of zero, then the IJTP will allocate into that table.  If all counter bits are set, then a failed allocation
+is signaled.  A saturating counter will be incremented on a failed allocation, and decremented on a
+successful allocation.  When the counter saturates, it indicates that we are having trouble installing new
+entries into the IJTP due to long-lived entries.  If saturation occurs, the counter bit arrays for all
+IJTP entries are flash cleared so that new useful entries may be installed.
+
+As mentioned in <<IJTP Organization>>, each IJTP entry only stores a portion of the target address. When
+allocating into the IJTP, the High Array is CAM'd with the upper bits of the resolved target.  If a matching
+entry is found, the index of that entry is written to the hiIdx field of the IJTP entry.  If no matching entry
+is found, an entry of the High Array is allocated according to a Pseudo-LRU replacement policy, and this index
+is written to the hiIdx field.
+
+==== Return Address Stack (RAS)
+The Return Address Stack (RAS) is a structure used to predict the target address of JALR instructions which
+are hinted to be function returns.
+
+===== RAS Behavioral Overview
+The RAS is conceptually a stack which tracks the function call stack. When a JAL or JALR encoding defined in the
+below table is encountered, a 'push' or 'pop' operation will occur that modifies the return address stack. A push
+operation pushes the computed the link value (PC+2/4) onto the RAS. For a pop operation the value on the top of the
+stack is used as the predicted target, and the top entry is popped off of the stack. For the combined push and pop
+operation the pop occurs first then the top entry is replaced with a new return address.
+
+.Predicted RAS Instructions
+[options="header"]
+[cols="6"]
+|===
+|Instruction | rd    | rs1   |rs1==rd | Push | Pop
+|JAL         | link  | -     | - | x | -
+|JALR        | !link | link  | - | - | x
+|JALR        | link  | !link | - | x | -
+|JALR        | link  | link  | 0 | x | x
+|JALR        | link  | link  | 1 | x | -
+|===
+
+[NOTE]
+In the above table _link_ is true if the register is x1 or x5
+
+The downside of using a simple stack structure in such a deep speculative micro-architecture is that
+if the core speculates down the wrong path of execution, the stack can be corrupted and not recoverable.
+For example, assume that at some point the contents of the stack are (from bottom to top of the stack):
+A, B, C, D.  So the next return will be predicted to jump to target D.  Then assume a branch or jump
+is mispredicted, and before the branch resolves we speculatively fetch a function return and
+then another funtion call at address E. The contents of the stack would then be: A, B, C, E.  At this
+point it is not possible to recover the stack properly after resolve the mispredicted branch because
+the address D was physically overwritten.
+
+The {project-name} RAS uses something more like a linked structure to be able to properly recover even
+after mis-speculating longer sequences of function calls and returns.  The basic idea is that once a
+call allocates an entry on the stack, we will not overwrite it until one of the following occurs:
+
+* The function call was flushed by an older branch misprediction or ROB flush
+* The function return which would pop this entry is retired
+
+This should guarantee that we can properly recover the stack after any mis-speculation unless
+the stack overflows, or software has a strange sequence of function calls and returns. For example
+a function call jump with no matching return, or vice versa.
+
+===== RAS Organization
+The RAS is organized as an array of entries with valid bits, a current stack pointer, the previous
+stack pointer, and an incrementing count (which wraps around) called the Call Age.  The age is used
+to identify which entries should be invalidated after a pipeline flush.
+
+.RAS Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|prevPtr    | Pointer to entry allocated by previous call
+|target     | Return target address
+|age        | Call age of this entry
+|committed  | Call instruction that allocated this entry committed
+|===
+
+At any time, the entry pointed to by the current stack pointer is referred to as the "top" entry.
+For better timing, the contents of the top entry are also available in a set of flops outside
+of the array.
+
+===== RAS Operations
+.Function Calls
+When a function call is encountered, the first invalid entry (from entry 0) is found by searching
+the valid bits.  That entry is then allocated (and the side flop storage is also written),
+with the fields being initialized as follows:
+
+* prevPtr: the current stack pointer
+* target: the address of the instruction following the call
+* age: the current Call Age + 1
+* committed: set to zero
+
+Then the current stack pointer is copied to the previous stack pointer, the current stack pointer
+is updated to point to the newly allocated entry, and the call age is incremented by one.
+
+.Function Returns
+When a function return is encountered, the entry pointed to by the current stack pointer (the "top"
+entry) is used for prediction.  The top entry's target is the predicted target of the return.
+The current stack pointer is updated with the top entry's prevPtr.  And the top entry's
+prevPtr is also used as a read index into the array to read that entry's prevPtr field, which is
+written into the previous stack pointer.
+
+The prevPtr field of the RAS entries enables precisely walking back the call stack.  And if there
+are speculative returns and calls in flight, multiple valid RAS entries may have prevPtr fields
+with the same value.
+
+.Avoiding Overwriting Stack Entries
+Where the RAS behavior diverges from a standard stack is when a function return and another function
+call are speculatively executed before the return is retired.  As described in <<RAS Behavioral Overview>>
+this would normally overwrite a stack entry.  In this design, when the function call is returned it will
+only allocate over an __invalid__ entry.  Entries are only invalidated if flushed, or if the function
+return that pops that entry retires.
+
+This does mean that even if the current call stack is only N function calls deep, the RAS
+may have more than N valid entries allocated while function calls and returns are in-flight and not
+retired.  If we have speculatively executed a sequence of return-call-return-call which are all
+not retired yet, the RAS will have N+2 entries valid and allocated for the speculative calls.
+
+.Commit Updates
+When function calls and returns retire from the BRQ, commit updates are sent to the RAS.  When a
+function call retires, the entry that it allocated is marked as committed.  When an entry is committed,
+it will not be invalidated by a flush even if the age comparison during a flush indicates that it looks
+younger than the flush.  Since the Call Age is a simple counter that wraps around, the commit bit is used
+to prevent accidentally flushing an entry after the age wraps around enough.  The bottom entries on the RAS
+are likely to live for a very long time.
+
+When a function return commit update is seen, the entry that it pops is then invalidated and able to be
+allocated by a later speculative function call.
+
+===== RAS Redirect Recovery
+While a pipeline flush is seen, the following actions are taken: invalidate entries younger than the
+flush, and recover the stack pointers and call age, and restore the top entry.
+
+.Flushing entries
+When a pipeline flush is seen, it has an associated Call Age.  This will be the age of the most
+recent call from __before__ the flush, or if the flushing instruction is a call itself, the age
+of the call. This age is then compared against the age field of every entry in the RAS.  Entries
+which look younger will then be invalidated, unless they are already committed.
+
+.Restoring the stack pointers and top entry
+Each flush also has an associated stack pointer. This will be the entry allocated by the most
+recent call from __before__ the flush, or if the flushing instruction is a call itself, the
+entry allocated by the call.  The current stack pointer is updated with the flush's stack pointer.
+This is then used to index into the array to recover top entry. The top entry's prevPtr field is
+then copied to the previous stack pointer.
+
+Recovery takes two cycles, and overlaps with the F0 (flush cycle) and F1 fetch stages.
+
+* F0: Restore the current stack pointer and call age from the flush pointer and age
+* F1: Read the array to restore the top entry, and previous stack pointer.
+* F2: RAS is restored and ready to make predictions.
+
+<<<
+== Rename and Dispatch
+After instruction fetch and decode, instructions are renamed to avoid false data dependencies, and
+then dispatched to the appropriate backend execution units.  Architectural registers are renamed to
+physical registers.  A high-level pipeline diagram of the rename and dispatch stages is shown below.
+Note that the diagram only considers a single-instruction wide pipeline. Multiple read/write ports on
+structures and bypassing paths are not illustrated.
+
+[#RenameDispatchPipe]
+.Rename and Dispatch Pipeline
+image::rename_dispatch_pipeline.png[]
+
+The main flow of instructions through rename and dispatch is as follows:
+
+* In ID stage, instructions are dequeued from the Instruction Queue. It is determined which execution
+unit (if any), and which execution pipelines support each instruction.
+* In REN stage, instructions will read the Map Table to determine the PR mapping for
+any sources.  Instructions which write a destination register will also allocate a PR from the
+free list and update the Map Table. Both the BRQ and PCMT are updated.
+* In DIS stage, instructions will update the RHF and ROB, and will be steered to the appropriate
+dispatch port and issue queue (depending on the type of instruction).
+
+Eventually, the instruction will either be flushed by a pipeline redirect, or the instruction
+will complete execution and be retired from the ROB.
+
+The main structures used for register renaming and dispatch are described in the following sections:
+
+* <<The Map Table, Map Table>>
+* <<The Free List, Free List>>
+* <<The Rename History File, Rename History File>>
+* <<The Reorder Buffer, Reorder Buffer>>
+* <<The Dispatch Buffers, Dispatch Buffers>>
+
+[#DecodeStalls]
+.Decode Stalls
+There are a few conditions which require stalling instructions in the decode stage:
+
+* The RHF is still rewinding after the previous pipeline flush.
+* An instruction which is guaranteed to cause a pipeline flush was decoded previously.
+* An older instruction has signaled an exception to the ROB and the flush hasn't happened yet.
+* The core is in single step mode and one older instruction is already in flight.
+* A PAUSE instruction is causing a stall.
+
+.Rename Stalls
+There are a few conditions which require stalling instructions in the rename stage:
+
+* The Free List doesn't have enough free PRs for all of the instructions in rename.
+* The PCMT does not have enough free entries to handle the instructions which may require
+allocating.
+* The BRQ does not have enough free entries for all the instructions which require allocating.
+
+.Dispatch Stalls
+There are a few conditions which require stalling instructions in the dispatch stage:
+
+* The RHF or ROB does not have enough free entries for all of the instructions in rename.
+* The Dispatch buffers do not have enough free entries to take instructions which need to dispatch.
+* The ROB is still rewinding after the previous pipeline redirect.
+
+=== Checkpointing
+Note: This is not currently implemented in the U8-series, but this section specs out how it may work in future
+generators.
+
+The core may be configured with a number of checkpoints which are intended to speed up
+recovery after a pipeline redirect.  In a simple scheme, checkpoints could be taken after every instruction
+which may cause a pipeline redirect, such as branches and jumps.  If all of the checkpoints are allocated, then
+new instructions could be stalled in the frontend until a checkpoints becomes available.
+
+However, in {project-name} the dependencies between loads and stores are speculated on.  So a misspeculation
+on a dependency may cause a pipeline redirect.  So now the set of instructions which requires checkpoints
+grows prohibitively large.
+
+Instead, in this architecture checkpoints are not tied to every instruction which may cause redirects,
+but are allocated every so often.  If a pipeline redirect occurs, we will try to restore from any checkpoint
+which is valid and *younger* than the redirect.  We then rely on rewinding from the checkpoint to the point
+of the redirect to finish recovery.  If there is no valid, younger checkpoint to restore from, then we fallback
+to doing a full rewind to recover the pipeline. The checkpoint then just gives us a starting point for rewind which
+is closer to the redirect point.
+
+In this way, increasing the number of checkpoints just increases the likelihood of being able to restore from
+a checkpoint when the redirect point is very old.  However, the amount of checkpointed state is quite large,
+so a small number of checkpoints (if any) is realistic.
+
+==== Checkpointed State
+* The Map Tables (integer and floating point)
+* The Free Lists (integer and floating point)
+* The RHF write pointer
+* The STQ write pointer
+* The PCMT reference counts
+
+How the checkpointed state is used after a redirect is described in the individual rewind handling sections on
+the structures mentioned above.
+
+==== Checkpoint Allocation
+The structures which must be rewound after a redirect are the ROB and the RHF.
+Because the ROB groups instructions into a single entry, a given ROB entry is likely to map to multiple
+RHF entries.  Because of this, it is also likely that the RHF will take more cycles to rewind than the ROB.
+So checkpoints are allocated after a given (configurable) number of RHF entries are allocated. The goal being
+that, if we are able to restore from a checkpoint, the worst case rewind delay for the RHF will be the number
+of cycles it takes for the core to fetch new instructions and have them make it to the rename stage.
+
+If all checkpoints are already valid, then the oldest checkpoint is simply overwritten.  This simply means that
+if an old instruction causes a redirect, the closest *younger* checkpoint is now further away and rewinding
+will take longer.
+
+==== Checkpoint Deallocation
+Checkpoints may be deallocated in two cases: the instruction which allocated the checkpoint retires from the ROB, or
+the instruction which allocated the checkpoint is flushed by a redirect.
+
+When a checkpoint is allocated, the ROB entry assigned to the instruction allocating the checkpoint is noted.
+The ROB retire pointer can then be compared against this to determine if the instruction has retired.  When a
+redirect occurs, an ROB entry number is also broadcast, and can be compared against.
+
+=== Map Table
+The Map Table is a structure which maintains the mapping from architectural register index to the most
+recently allocated physical register which stores the value of that architectural register.  There are two
+separate Map Tables, one for the general purpose x registers, and one for the floating point f registers.
+
+.Zero PR
+Note that register x0 is always hardwired to zero.  In this architecture, Integer PR 0 is also hardwired to zero.
+The x register Map Table entry 0 will always point to PR 0.
+
+==== Map Table Datapath
+Each instruction in the rename stage will read the map table to get the physical register indices for
+its two possible register sources (3 for floating point instructions), and also for its possible
+destination register.  Instructions which have fewer register sources (e.g. instructions with immediate
+sources), or no destination register, will simply ignore the map table output at those ports.  For lower
+power consumption, these instructions will be detected in the ID stage and the map table read muxes will
+not be toggled. Similarly, instructions which read x registers will not read the floating point map table,
+and vice versa.
+
+Instructions which write to a register will update the Map Table with the physical register index that was
+allocated for that instruction from the Free List.  There are write-to-read bypass muxes in case younger
+instructions depend on updates from the older instructions within the same rename stage.
+
+==== Map Table Rewind Handling
+After a pipeline redirect occurs (due to misspeculation or a trap is taken), the Map Table needs to be recovered
+to a potentially earlier state.  Any update made after the point of the misspeculation or trap needs to be undone.
+Until the recovery is complete, any new instructions on the correct path will be stalled in rename.  Theoretically,
+it would be possible to track which Map Table entries have been completely recovered, and not stall instructions
+in rename which only reference recovered entries.  However, this pipeline does not have a mechanism to track
+such information, so all instructions are stalled in rename until the entire Map Table is recovered.
+
+This recovery is handled by two different operations:
+* Checkpoint recovery (if checkpoints are included)
+* Rewinding updates from the Rename History File
+
+.Checkpoint Recovery
+If checkpoints are configured as included, then after a pipeline redirect the checkpoint control logic will
+attempt to find a valid checkpoint to restore from (see <<Checkpointing>> for details).  The entire contents
+of the Map Table are checkpointed, so the contents of the checkpoint are simply copied back into the main
+Map Table.  After restoring from the checkpoint, it's likely that some amount of rewinding is still necessary,
+which is described below.
+
+.Rewind Recovery
+During rewind, all of the updates to the Map Table that had taken place after the redirect point must be undone.
+For each update to the Map Table, the index that was updated (the AR index), and the value that was overwritten
+(the previous PR index) are stored in the RHF.  During a rewind, the RHF will supply this information for
+a configurable number of updates per cycle (the rewind rate), so that the Map Table can reverse the update.
+the previous PR index is written back to the entry indexed by the AR index.
+
+Note that the normal read and write ports to the Map Table are re-used during rewind.  If the rewind rate is configured
+as greater than the rename rate (to provide speedier recovery), then there will be extra write ports on the
+Map Table only used during rewind.
+
+=== Free List
+The Free List keeps track of physical registers which are currently un-mapped and free for allocation by
+a new instruction with a destination.  There are separate Free Lists for the x registers and floating point
+registers. The Free list is maintained as a bit-vector, where a 1 in position
+__i__ indicates that physical register __i__ is free.  Note that register x0 is handled as a special case, and
+is hardwired to zero.  Bit 0 of the free list vector for the x registers will never be set to 1'b1, so that
+x PR 0 will never be allocated to a renaming instruction.
+
+==== Free List Datapath
+A diagram of the main datapaths around the free list is given below, assuming a configuration with 64 PRs and
+two-wide rename and rewind or retire.  There are two main operations that are performed on the free list: allocation
+of PRs, and returning of PRs to the free list. The left side of the diagram represents the logic to return a PR
+to the free list, and the right side of the diagram represents the logic to allocate PRs from the free list.
+
+[#FreeListDatapath]
+.Free List Datapath
+image::freelist.png[]
+
+==== Free List PR Allocation
+All instructions which write to a destination register (other than x0), will allocate a PR for the result value.
+The right side of the datapath diagram above illustrates the allocation logic.
+Generating the PR index is done with a find-first-one search on the vector, and a priority encoder.  If the
+core is configured to rename multiple instructions per cycle (the Rename rate), then that number of
+find-first searches are done.  The first search is done starting from the LSB of the vector, the second
+search is done starting from the MSB, the third search is done starting from the LSB (with the first search result
+masked out), etc...  The PR index is then provided to update the Map Table and pass down with the instruction's
+payload.
+
+To prevent long timing paths from searching the bit vector to encoding the PR index to updating the Map Table,
+the PR indexes are pre-allocated into allocation registers. The number of allocation registers is the same as
+the rename width.  After reset, the first free PRs
+are removed from the vector, encoded, and placed into the allocation registers. Then, when an instruction
+in the rename stage needs to take a PR (consume the allocation register), the load enable on the allocation
+registers is set and the next free PRs are loaded into the allocation registers.  This way the PR indexes
+are available directly from a flop in the rename stage.  When allocation registers are consumed, register 0
+is always consumed first, followed by register 1, etc...  Note that the oldest instruction in the rename stage may
+not need to allocate a PR, while younger instructions may.  Logic outside the Map Table will route the PR for
+the "1st allocating instruction" to the younger instruction.
+
+.Empty Conditions
+The search logic does not explicitly check whether multiple searches returned the same PR index (when the free
+list is close to empty). Instead, a counter is used to maintain the number of 1's in the bit-vector. The
+allocation registers also each have valid bits to indicate whether the index encoded in the register is
+valid (that PR is free).  When a bit is cleared from the vector, and the encoded PR index is loaded into
+the allocation register, then the counter is decremented.  When a PR is returned to the bit vector, the counter
+is incremented.
+
+When filling the allocation registers, register 0 has highest priority followed by register 1, etc...  If the counter
+value is low enough such that there are not enough free PRs to fill the allocation registers, then the valid bits
+of the remaining unfilled allocation registers are set to zeros.  Note that it is possible for a higher-indexed allocation
+register to be valid, and a lower-indexed register to be invalid.  This is why in the datapath diagram there is a 2:1
+mux on the output for the 1st allocating instruction.  For a 3-wide rename configuration there would be a 3:1 mux
+for the 1st allocating instruction and a 2:1 mux for the 2nd allocating instruction. To illustrate how this case may
+happen, consider the following sequence of events (for a 3-wide rename configuration):
+
+. All three allocation registers are initially valid.
+. In a given cycle, only 2 instructions need to allocate PRs, so allocation registers 0 and 1 are consumed.
+. The bit-vector is empty, and the counter value == 0, so allocation registers 0 and 1 are set to invalid for the next
+cycle.  Allocation registers 2 remains valid.
+
+Eventually as PRs are returned to the free list, allocation registers 0 and 1 will become valid again.
+
+==== Free List Retire and Rewind Handling
+.Retire Handling
+When instructions with valid register destinations retire, the PR index that they overwrote in the Map Table must
+eventually be returned to the free list.  This PR index is supplied by the RHF (refer to <<RHF Retire Handling>> for
+more detail).  When a valid PR index is supplied by the RHF, it is decoded back into a one-hot vector.  Multiple
+PRs (up to the retire rate) may be supplied per cycle.  These one-hot vectors are then OR'd together, and the resulting
+multi-hot vector is then OR'd into the free list bit-vector.
+
+.Checkpoint Handling
+If the core is configured with checkpoints (see <<Checkpointing>> for details), then the contents of the
+free list bit-vector are checkpointed.  After a redirect, if the checkpointing logic determines that we
+can restore from a checkpoint, then the checkpointed copy is restored to the main free list bit-vector,
+and then any necessary rewinding is done as described below.  Note that when PRs are returned to the
+main free list from normal retirement (not rewind), *they must also be returned to any valid checkpoints*.
+
+.Rewind Handling
+During rewind, PRs that were allocated from the free list by squashed instructions are returned to
+the free list.  These PR indexes are provided by the Map Table (see <<Map Table Rewind Handling>> and
+<<RHF Rewind Handling>> for more detail).  To avoid having a large number of write ports into the free list,
+the PR indexes from the Map Table are muxed with the PR indexes from the RHF (from retirement). To prevent
+losing PRs, retirement from the RHF will be stalled during rewind so that there is no collision on these
+muxes.
+
+=== Branch Resolution Queue
+Branches may be executed and resolved out-of-order.  The Branch Resolution Queue (BRQ) is a queue-like
+structure which stores information about branches and jumps which are in-flight in the pipeline.
+The BRQ holds information necessary to update the prediction structures based on the result of
+the branch or jump execution. BRQ entries are only allocated by conditional branches, JALR instructions,
+and JAL instructions which act as RAS push operations.
+
+The main interfaces are illustrated in the diagram below.
+Branches and jumps write information into the BRQ in the REN stage. The execution units provide information
+after the branch or jump is executed and resolved, and the ROB provides information about which
+branches or jumps have retired from the ROB.  Branches or jumps which have retired may then
+require updating the branch prediction structures. Note that multiple branches and/or jumps may be
+renamed per cycle.  The BRQ is implemented as a banked structure, so that each bank only requires a
+single write and single read port.
+
+.Main BRQ Interfaces
+image::brq.png[]
+
+The BRQ is maintained through 3 different pointers:
+
+* The read pointer: Points to the oldest entry in the queue (if any are valid)
+* The update pointer: Points to the next entry which may require updating the predictors
+* The retire pointer: Points to the next entry waiting to be retired by the ROB
+* The write pointer: Points to the next entry to be allocated by a new branch or jump
+
+If the write pointer equals the read pointer then the queue is considered full.  The update pointer may
+lag behind the retire pointer due to back-pressure from the BDP update pipeline, and the fact that
+at most one entry may generate an update per cycle while multiple entries may be retired per cycle.
+The read pointer is always one entry behind the update pointer. This is to allow the BRQ to keep around
+one already retired entry to restore from, in the event that an ROB pipeline flush is generated by an
+instruction which did not allocate a BRQ entry.  So the prediction structures may be restored to a valid
+state.
+
+.BRQ Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|isBr       | Entry is for conditional branch
+|ijtp       | Entry is for jump predicted by IJTP
+|call       | Entry is for function call (RAS push)
+|ret        | Entry is for function retunr (RAS pop)
+|predicate  | Entry is for conditional branch of converted CMOV
+|pcmtIdx    | Index of PC Map Table entry for MSBs of PC
+|pcLow      | LSBs of PC
+|predDir    | Predicted direction
+|ijtpInfo   | Prediction information from IJTP
+|prediction | Prediction information from BDP and RAS pointer,age
+|===
+
+TODO: If the BRQ stores compressed PCs (using the PCMT), then we need to make sure that
+PCMT entries are not deallocated before the BRQ gets to read it.  Normally, the PCMT entry is
+deallocated after the last ROB entry to reference that entry is retired.  But BRQ retirement
+and predictor updating happens after ROB retirement.  Could count branches as extra references
+on the PCMT, and have BRQ send back signal to decrement reference count.
+
+.Predictor Update Ordering
+In general, updates to different BDP entries could proceed out-of-order,
+however to avoid requiring logic to detect when multiple branches use the same BDP entry,
+all BDP updates will proceed strictly in order.  Also, it is possible to update the
+predictors speculatively.  In this design, the BRQ will keep track of which entries have been retired from
+the ROB, meaning the branches were non-speculative.  Only branches retired from the ROB will
+be allowed to update the predictors.
+
+The IJTP updates occur in the WB stage, and are therefore speculative and potentially out-of-order.
+
+The RAS updates occur after retirement, and in-order.
+
+.BRQ Entry Allocation
+When a branch or jump is in REN stage, it will allocate a BRQ entry and write in information such as the
+type of branch/jump, prediction information, and PC information.  The index is then passed down the
+pipeline along with the branch or jump.  The write pointer will be incremented for each allocating
+branch.
+
+.Branch Resolution Updates
+An execution pipeline which supports resolving branches and jumps will have an interface to report
+the execution and result of a branch or jump (see <<Branch Resolution>> for details). When an update
+is signaled from the execution pipeline, the BRQ entry will be updated with information about the
+resolved direction of the branch and whether it was mispredicted.
+
+.BRQ Entry Retirement
+When entries retire from the ROB, the ROB will send a count of branches and/or jumps that were retired.
+The BRQ retire pointer will be incremented by this amount.  Entries which are "retired" in this manner
+will be allowed to update the predictors (if it is determined that they need to).  Entries
+may not be deallocated immediately, depending on whether the prediction structures need to be updated
+and any back-pressure from the predictor update pipelines.
+
+.BRQ Entry Deallocation
+After an entry is retired (the retire pointer has moved past this entry), the update pointer and read
+pointer must pass this entry before it can be deallocated.  The update pointer will only move past retired
+entries at some number of entries per cycle.  The update pointer may move past entries which do not need
+to update the predictors.  When the update pointer reaches an entry requiring an update,
+the pointer will be used to mux out information from the BRQ which is necessary for the update.
+The BDP update pipeline may exert back-pressure, in which case the update pointer movement will be stalled.
+
+.Pipeline Redirects
+A pipeline redirect will include a BRQ index, which the BRQ write pointer should be restored to.
+The BRQ does not need to recover anything during pipeline rewind.
+
+=== PC Map Table
+The PC Map Table (PCMT) is a structure with a configurable number of entries used to compress the PCs that
+are passed down the pipeline with instructions, to save area.  Most of the time, all of the instructions in
+the window come from a small number of memory regions.  For example, if the core is executing out of a small
+loop for a while, eventually all of the instruction PCs in the window will have the same most-significant bits.
+
+To exploit this redundancy, the PCMT provides a mapping from upper PC bits to a smaller encoded
+table index.  When an instruction is renaming, it will CAM the PCMT to find an entry which matches
+the upper bits of the instruction's PC.  If no such entry exists (because the instruction is the first
+one in the window fetched in a new region of memory), a new entry is allocated.  If not enough free entries exist,
+then the instruction will stall in rename. The instruction then continues down
+the pipeline with the lower (un-mapped) PC bits, and the PCMT index.  If the pipeline needs to reconstruct
+the full PC, the PCMT will provide read ports to return the upper mapped PC bits.
+
+Each entry in the PCMT maintains a reference count to know when an entry may be deallocated.  When an instruction
+dispatches to the ROB, the ROB stores the index of the PCMT entry used by that instruction.  The reference count
+is incremented for each ROB entry allocated which points to that entry. The count is decremented for each ROB entry
+retired or rewound which points to that entry.  When the count reaches zero, the entry is deallocated.
+
+.JALR Handling
+The PCMT is also used to compress the upper bits of predicted JALR target addresses. The tricky part here is that
+the target of a JALR may be in a different memory region than the JALR instruction itself, and the target instruction
+may be in REN stage in a later cycle.  What we require is that the PCMT entry for the predicted target address
+be established before the JALR is in RR stage in the branch unit (when it reads the PCMT for the target address).
+To handle this, the RDU will detect when a JALR instruction is the last valid instruction in a rename group.
+An extra CAM and allocation port exists for this last JALR instruction to lookup it's predicted target address.
+JALR instructions will then dispatch with two PCMT indexes as part of their payload: one PCMT index for the upper
+PC bits, and one PCMT index for the upper target address bits.
+
+.Configuration Parameters
+* The number of entries in the PCMT
+* The number of upper PC bits to compress
+
+The number of upper PC bits to compress is a trade-off between how many PC bits can be compressed, and how
+many entries are needed in the PCMT.  If more PC bits are mapped into a single PCMT entry, then it is more likely
+that all of the instructions in the window will map into a larger number of entries.  For example, if we compress
+all bits above the cache block offset bits of the PC into N entries, then we would only be able to support instructions
+from N different cache blocks past dispatch.  A reasonable design point is to use slightly fewer bits than the number
+of virtual page number bits.
+
+==== PCMT Retire and Rewind Handling
+After retirement or a pipeline redirect, the PCMT reference counts need to be updated or recovered.
+
+.Retirement
+During retirement, the ROB will send a number (the retire rate) of pcmt indexes along with valid bits.
+The indexes will be decoded to generate a number of enable signals for each entry.  Each entry will then
+sum up the enable signals and decrement the reference count by that number.  If the decremented reference
+count equals zero (and no newly dispatching instructions reference this entry), then the entry will be deallocated.
+
+.Checkpoint Recovery
+If checkpoints are configured, then the reference counts for each entry are checkpointed. After a pipeline
+redirect, the checkpoint logic will attempt to find a valid checkpoint to recover from.  If possible, the
+checkpointed copies of the reference counts are simply copied back.  After restoring, it's likely that
+some amount of rewinding is still necessary.
+
+.Rewind Recovery
+During rewind, the ROB will re-use the same retirement interface to send a number of pcmt indexes along with
+valid bits.  The reference counts will be decremented, and the entry will be deallocated in the same way as described
+for retirement above.
+
+=== Rename History File
+The Rename History File (RHF) is a FIFO structure which keeps track of all the updates to the Map Tables.
+It provides a history of all of the physical register allocations, and which architectural register
+index they map to.  The single RHF tracks updates to both the x register mapping and the floating point
+register mapping.  The RHF serves two main functions: to recover the Map Table after a pipelined redirect,
+and to return PRs to the free list after retirement.
+
+The RHF maintains two important pointers: the read pointer and the write pointer.  The read pointer points
+to the next RHF entry to be retired.  The retirement process is described below in <<RHF Retire Handling>>.
+The write pointer points to the next entry to be allocated by instructions in rename.  When the RHF becomes
+full, or close to full, instructions will be stalled in rename until the necessary number of RHF entries
+become available.
+
+.RHF Entry Contents
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|destIsFP   | The update is for the floating point Map Table
+|returnToFL | Return prevPRIdx to Free List at retire (refer to <<Move-Elimination>>)
+|destARIdx  | destination AR index for the update
+|prevPRIdx  | The previous PR index which was mapped to the destination AR index
+|===
+
+==== RHF Renaming Example
+Consider a short example instruction sequence below.  Assume that the mappings for r3, r4, and r5
+are already set to P2, P6, and P7 respectively. Also assume that the first add instruction allocates
+RHF entry 0, and the beqz instruction is predicted not-taken.
+[source]
+----
+Example instruction sequence.
+Assume existing AR -> PR mapping of: r3->P2, r4->P6, r5->P7
+
+add   r3, r1, r2        // allocated P9,  so r3->P9
+sub   r4, r3, r6        // allocated P10, so r4->P10
+beqz  r4, foo           // no dest PR
+ld    r3, 0(r4)         // allocated P14, so r3->P14
+
+foo:
+add   r5, r3, r9        // allocated P19, so r5->P19
+----
+
+[#RHFRenameExample]
+.RHF rename example
+image::rhf_rename_example.png[]
+The diagram above gives the contents of RHF entries 0-3 after the 5 instructions are renamed.
+The *beqz* instruction does not allocate an RHF entry because it does not write to a register.
+Therefore the *ld* allocates RHF entry 2, and the last *add* allocates entry 3.  Note that the *ld*
+writes to the same register as the first *add*, so the prevPRIdx is the PR that was allocated by
+the first *add* (P9).
+
+==== RHF Datapath
+Because the RHF is a FIFO with a relatively large number of entries, it is physically implemented
+in banks to reduce the number of read and write ports on each entry.  The number of banks in the RHF
+must be greater than or equal to the dispatch width, so that only a single write port is needed per-bank.
+The number of banks must also be greater than or equal to the retire width, so that only a single
+read port is needed per-bank for retirement or rewind.
+
+The dispatch interface to the RHF is a number of logical write ports (the rename width). Only instructions
+which write to a destination register will allocate an RHF entry. The RHF will compact out any instructions
+which do not allocate an entry, and then the RHF will rotate the data to the correct bank based on the
+current write pointer.
+
+Similarly, the read ports for retirement or rewind will read up to one entry from each bank, and then
+rotate the read data.  During retirement, entries are read in the direction from read to write pointer, and during
+rewind the entries are read in the direction from write to read pointer.  Only one set of rotation muxes is needed
+though because the retirement data fans out to different logic than the rewind data.  The rewind datapath
+is just connected to different wires on the outputs of the rotation muxes.
+
+==== RHF Retire Handling
+When ROB entries retire, the number of RHF entries allocated by instructions in that group is known.
+During retirement, the ROB will indicate the total number of RHF entries to be retired.  The ROB may
+indicate a number that is larger than the retire rate of the RHF, so the RHF maintains a counter of
+the number of entries remaining to be retired.  When this count is greater than zero, and the pipeline
+is not rewinding, the normal retirement process occurs.  For detail on the RHF operation during pipeline
+rewinds, see <<RHF Rewind Handling>>.
+
+Starting from the RHF read pointer, up to a configurable number of entries (the RHF retire rate) will be
+read out from the FIFO.  For each of these entries, the prevPRIdx field indicates the PR index which should
+be returned to the Free List.  This is the PR index which was overwritten in the Map Table, and no younger
+in-flight instructions in the pipeline may reference this PR anymore, so it is safe to return to the free list.
+The RHF read pointer will be incremented by the number of retiring entries (up to the retire rate), and the
+counter will be decremented by the same amount.  Note that if the move-elimination feature is configured, then
+PRs may not be immediately returned to the free list.  See <<Move-Elimination>> for more details.
+
+As an illustration, consider the example in <<RHF Renaming Example>>.  If the first add instruction retires
+from the ROB, RHF entry 0 will eventually be retired, and PR 2 (from the prevPRIdx field) will be returned
+to the freelist.
+
+==== RHF Rewind Handling
+In the event of a pipeline redirect, the rewind process handles recovering the Map Table and other pipeline
+structures to a correct state.  Because the rewind process needs to complete before new instructions may be
+renamed, it is critical to performance that the rewind finish quickly.  Because of this, after a pipeline
+redirect, RHF retirement will be paused, and the RHF read ports will be used for rewinding.  When rewinding
+is complete, the RHF may resume retiring entries.
+
+.Checkpoint Recovery
+If the core is configured with checkpoints (see <<Checkpointing>> for details), then the RHF write
+pointer is checkpointed.  After a redirect, if the checkpointing logic determines that we can recover from
+a checkpoint, then the checkpointed write pointer is restored.  This restored write pointer is then the
+beginning point for rewinding as described below.
+
+During a pipeline redirect, the RHF is provided with the index to restore the write pointer to (from a
+  checkpointed copy or not).
+Starting from the current write pointer (minus 1), and working towards the flush index, entries are read out of
+the RHF at a configurable rate (the Rewind rate).  Each RHF entry corresponds to an instruction which
+updated the Map Table with a newly allocated PR.  For each of these entries, the Map Table is looked up
+(using destARIdx as the index) to retrieve the PR that was allocated.  That same Map Table entry is then
+overwritten with prevPRIdx, the previous mapping that this instruction overwrote during rename.  The
+PR index that was read from the map table is then returned to the Free List. Note that if the move-elimination
+feature is configured, then PRs may not be immediately returned to the free list.  See <<Move-Elimination>>
+for more details.
+
+Once the RHF write pointer becomes equal to the flush index, the RHF signals that the rewind operation
+is complete.  As soon as the last update to the Map Table takes place, then any new instructions in
+the rename stage no longer need to be stalled (unless the ROB rewind is still taking place).
+
+As an illustration, consider the example in <<RHF Renaming Example>>.  Assume that the *beqz* instruction
+mispredicted, and the updates from the *ld* and last *add* instructions need to be undone. The *beqz*
+instruction was passed down the pipeline to the execution unit with the value of the RHF write pointer
+as it was __immediately after the branch__ (entry 2). So the flush index will be RHF entry 2. The rewind logic will:
+
+* Read entry 3 of the RHF. Read the Map Table entry 5 (from destARIdx) and see that PR 15 should
+be returned to the free list. At the same time write PR 7 (from prevPRIdx) back to Map Table entry 5.
+* Read entry 2 of the RHF. Read the Map Table entry 3 (from destARIdx), and see that PR 14 should be
+returned to the free list.  At the same time write PR 9 (from prevPRIdx) back to Map Table entry 3.
+* See that the entry corresponding to the flush index (entry 2) has been rewound, so the RHF rewind process is complete.
+
+[[section-reorder-buffer]]
+=== Reorder Buffer
+The Reorder Buffer (ROB) is a FIFO structure that is used to maintain the program ordering for in-flight
+instructions.  The ROB allows for precise exception handling, and recovery of certain pipeline structures
+after misspeculations or traps are taken.  The ROB tracks instructions from the time of dispatch, until they
+are executed and non-speculative and eventually retired from the pipeline in-order.
+
+The ROB maintains three major pointers:
+
+* A retire pointer which points to the next entry to be retired
+* A commit pointer which points to the next entry to be committed
+* A write pointer which points to the next entry to be dispatched
+
+==== ROB States
+Entries in the ROB are considered to be in one of multiple states:
+
+* Invalid: ROB entry is invalid and unoccupied
+* Valid: ROB entry is valid and contains information about some in-flight instruction(s)
+* [[RobStatesCommitted]] Committed: ROB entry is valid, and is guaranteed that it will not be flushed by some older event. Waiting
+to be retired.
+
+The reason for tracking whether an entry is committed or not is because certain instructions must only be allowed
+to execute once they are known to be non-speculative (e.g. stores or CSR access which may have side-effects).
+This is determined by maintaining
+a separate pointer called the commit pointer.  The commit pointer will increment past valid entries in the ROB
+and stop when it reaches an entry which contains an instruction which may redirect (e.g. an unresolved branch).
+Once the potential redirect is resolved, the pointer will continue moving.  The ROB commit pointer will be broadcast
+to execution units so that they may determine which instructions are committed.
+
+The retire pointer will move past committed entries which have also completed execution, up to a configurable
+number of entries per cycle (the ROB retire rate).  Once an entry is retired, it will become invalid again.
+
+==== ROB Instruction Grouping
+For better area and power efficiency, the ROB tracks groups of instructions instead of only
+individual instructions.  A group of instructions can loosely be thought of as a basic block, such that
+no instruction in the middle of the group will cause an exception or pipeline redirect. The maximum size of
+the group is limited and configurable, partially because the likelihood of large groups is small.  The
+rules which govern the grouping of instructions are described below.
+
+.Instruction Grouping Rules
+* An instruction which may cause a redirect or exception must end a group. E.g. branches, JALR, loads, or stores
+* An instruction which is known at dispatch time to cause an exception will start and end a group
+* An instruction will end a group when the group size hits the maximum size
+* An instruction refers to a different PCMT entry than the previous instruction must start a group
+* System instructions will start and end a group
+* An instruction with the replay flag set will start and end a group
+* Divide instructions will start and end a group. The ROB entry number is assumed to be unique in the execution
+pipeline
+
+The decoder will generate two signals for each instruction: whether it needs to start a group, and whether
+it needs to end a group.  An instruction may need to do both. Note that instructions which are dispatched
+in different cycles may be placed in the same group.  A group may be ended even though the decoder
+indicated that an instruction did not need to end a group.  This may happen if the maximum group size is
+reached.  Dispatch will maintain information about the size of the most recent group.
+
+Several <<Chicken Bits>> exist to disable ROB grouping for certain types of instructions, or disable all ROB
+grouping. The ROB itself will also disable all grouping in the case where an instruction which grouped
+causes an ROB flush (see <<ROB Trap Sequence>> for details).
+
+Because the ROB needs to determine whether an entry has completed executing, each ROB entry maintains a counter
+of the number of completions expected for that entry.  For example, if 3 add instructions group into the same
+entry, the ROB knows to expect 3 completion signals for that entry.
+
+==== ROB Datapath
+Because the ROB is a relatively large FIFO structure, it is physically implemented in banks to reduce the
+number of read and write ports on each entry.  The number of banks in the ROB must be greater than or equal
+to the dispatch width, so that only a single write port per-bank is needed.  The number of banks must also be greater
+than or equal to the retire width, so that only a single read port is needed per-bank for retirement and rewind.
+
+The dispatch interface to the ROB is a number of logical write ports (the rename width), and the ROB will rotate the
+data to the correct bank based on the current write pointer.  In the case that multiple instructions are grouped
+into the same entry, only some fields of the ROB entry need to be updated for each instruction, such as the number
+of RHF entries allocated by the group.  The fields which do not change based on new instructions in the group are
+only written once, by the instruction to start the group.
+
+The ROB storage is physically separated into two portions:
+
+. Fields which are only written at dispatch and are only read during retirement, or when redirects and rewinds occur
+ (RAM fields)
+. Fields which may be updated or used during any cycle in which that entry is valid (Flop fields)
+
+The first case of storage lends itself to being implemented as a RAM structure (not necessarily an SRAM) with a small
+number of read ports and a single write port.  The second case of storage must be mapped to flops.
+
+.ROB RAM Fields
+[options="header"]
+[cols="1,3"]
+|===
+|Field    | Description
+|nInst    | Number of instructions in group
+|nBytes   | Number of bytes of instruction opcodes in group
+|nDests   | Number of RHF entries allocated by instructions in group
+|pcLow    | LSBs of PC of first instruction in group
+|pcmtIdx  | Index to PC Map Table
+|brqIdx   | BRQ index (assuming entry has branch)
+|rhfPtr   | Pointer to first RHF entry allocated (if any) by group
+|hasBr    | Group contains a branch or jump which allocated BRQ entry
+|hasSt    | Group contains a store
+|===
+
+.ROB Flop fields
+[options="header"]
+[cols="1,3"]
+|===
+|Field    | Description
+|valid    | Valid bit for this entry
+|rslv     | Group is known to either cause a flush or not
+|cmpl     | All instructions in group have completed executing
+|cmplCnt  | Counter for number of expected completions for this entry
+|hasMem   | Group contains a load or store instruction
+|grouped  | Group contains multiple instructions
+|===
+
+The nInst field is used for updating the instret CSR as well as for instruction trace.  The nBytes field is used
+for instruction trace.
+
+==== ROB Retire Handling
+As described in <<ROB States>>, the ROB maintains a retire pointer which will increment past committed entries
+which have also completed execution.  When an entry is retired, certain information is read out of the ROB entry
+and used to update other blocks in the core.  Note that retirement is stalled during pipeline rewind, so that
+the ROB read ports may be re-used for rewind.
+
+The destCnt field of the ROB entry is used to calculate the number of RHF entries that should be retired (see
+  <<RHF Retire Handling>> for details).  The destCnt field of all retiring entries is summed together and sent
+to the RHF as a single count.
+
+The pcmtIdx field is used by the PC Map Table to know when an entry should be deallocated (see
+<<PCMT Retire and Rewind Handling>> for details).
+
+The hasBr field is used to determine how many branch or jump instructions which allocated BRQ entries
+have retired.  All of the retiring branches/jumps are counted during each retire cycle, and the sum is
+sent to the BRQ so that the BRQ may advance its retire pointer.
+
+==== ROB Rewind Handling
+After a pipeline redirect, certain information may need to be read out of ROB entries which were flushed in
+order to rewind updates to different pipeline state.  Every pipeline redirect has an associated ROB entry, which
+indicates the youngest entry to remain valid after the redirect.  In the case of branches and jumps, a mispredict
+will cause a redirect and include the ROB entry which contains the branch or jump.  In the case of memory ordering
+violations, in which the instruction causing the violation must itself be flushed and re-fetched, the ROB entry
+is the entry *before* the one containing the memory instruction.
+
+.Checkpoint Recovery
+If the core is configured with checkpoints (see <<Checkpointing>> for details), then the ROB write
+pointer is checkpointed.  After a redirect, if the checkpointing logic determines that we can recover from
+a checkpoint, then the checkpointed write pointer is restored.  This restored write pointer is then the
+beginning point for rewinding as described below.
+
+During a pipeline redirect, the ROB is provided with the index to restore the write pointer to (from a
+checkpointed copy or not). Starting from the current write pointer (minus 1), and working towards the
+entry number associated with the flush, entries are read out of the ROB at a configurable rate (the Rewind rate).
+
+The hasLd and hasSt fields indicate that a load or store instruction incremented the LDQ and STQ write pointers
+respectively.  So when rewinding and ROB entry with those bits set, the LDQ and STQ write pointers maintained
+in dispatch are *decremented*.
+
+The pcmtIdx field indicates which PCMT entry contains the upper PC bits for the instructions in a given ROB
+entry.  Because the PCMT reference counts are incremented when an ROB entry is allocated, during rewind the
+pcmtIdx field is used to *decrement* the reference counts.
+
+==== ROB Exception Monitor
+Because instructions can execute speculatively and out-of-order, it's possible that a speculative non-committed
+instruction may encounter an exception. Different sources of exceptions in the pipeline have interfaces to report
+exceptions to the ROB, and the ROB will monitor these interfaces. The ROB will maintain information about the oldest
+exception signaled by an instruction in the window, and which ROB entry that instruction corresponds to.  The age
+of an exception is determined by comparing ROB entry numbers.  The ROB exception monitor is also used to generate
+pipeline flushes for events that are not strictly exceptions, such as FENCE.I instructions which must flush the
+pipeline after invalidating the I-Cache.
+
+If a valid exception has already been noted in the exception monitor, and an older exception is signaled, then
+the contents of the exception monitor will be overwritten.  If the new exception is younger, then it is ignored.
+
+.ROB Exception Monitor State
+[options="header"]
+[cols="1,3"]
+|===
+|Field    | Description
+|valid    | Exception was signaled
+|gid      | ROB entry number of instruction which caused exception
+|cause    | Encoding of cause value to be reported during trap
+|badaddr  | Value to be reported in the tval field during trap
+|excType  | Internal encoding of type of exception
+|===
+
+If the exception monitor is valid, it will prevent the corresponding ROB entry from retiring normally.
+Instead, when the ROB retire pointer becomes equal to the exception's ROB entry, then the trap sequence
+is triggered.  When the trap is taken, a pipeline redirect will occur which will flush the exception's ROB
+entry and any younger entries.
+
+.LSU Fast Flushes
+There are certain situations in the LSU where an instruction must be flushed and re-fetched (required a pipeline
+flush), but we cannot wait for that instruction to get to the retire pointer before flushing because it may never happen.
+In these cases, the ROB will start the exception pipeline immediately after sending a signal to the branch
+unit's Issue Queue to prevent issuing branches. Normally ROB flushes are always older than branch flushes,
+so no age comparison is needed if both occur in the same cycle.  We prevent branches from issuing so that an
+LSU fast flush and a branch flush cannot occur in the same cycle, so we don't need to add age comparisons.
+
+Note that because LSU fast flushes start speculatively, we may need see another older exception while the
+LSU fast flush is in E0, E1, or E2 stage (see <<ROB Trap Sequence>> for more detail).
+
+LSU fast flushes must also stall retirement for one cycle, so that the ROB read port may be overridden to read
+out information needed to generate the flush.  The normal exception pipeline doesn't need to do this, because
+it only happens when the exception gets to the retire pointer, which is already the read pointer for the ROB.
+
+.Interrupt Handling
+When interrupts are pending and enabled, the interrupt must eventually be handled. An interrupt cannot be
+taken before instructions which are committed are allowed to finish executing and retire. This is handled
+by setting a flag in the ID stage when an enabled interrupt is seen. When the next instruction is
+seen in ID stage, it is forced to look like an exception with the interrupt's appropriate cause value.
+This instruction will then dispatch into the ROB and set the exception monitor.  The trap will then be taken
+through the normal exception monitor handling.
+
+The reason that we wait for a valid instruction to be seen in ID is so that we have a valid PC to record
+in the xEPC CSR.  The downside is that if the frontend is stalled on an I-Cache miss, the trap will be delayed.
+If this is a problem, there are ways to allow the RDU to record the next expected PC at the expense of some
+logic. Then it is possible to take an interrupt even in the presence of an I-Cache miss.
+
+==== ROB Trap Sequence
+When exceptions or interrupts require a trap to be taken, the ROB performs a few operations which are
+pipelined across three stages E0-E2:
+
+* E0: Detect that exception monitor is valid, and ROB entry made it to retire pointer (or is an LSU fast flush).
+Read out the ROB entry from the array.
+* E1: Reconstruct the PC by reading the lower PC bits from the ROB entry, reading pcmtIdx from the ROB entry,
+and reading the upper PC bits from the PCMT. Determine target address of trap and send PC, cause, and badaddr
+to the CSR File. Send brqIdx for BRQ to restore.
+* E2: Flush the pipeline to the target PC.
+
+Note that the CSRs are only updated when real exceptions happened, not if we simply need to flush the pipeline.
+The ROB also sends a signal to flush the I-Cache when a FENCE.I instruction is in the E2 stage of the exception
+pipeline.
+
+.Load/Store ROB Grouping
+By default, loads and stores are allowed to group with other instructions as long as they end a group.
+If the load or store groups with older instructions, and ends up causing an exception or fast flush, the older
+grouped instructions will also be flushed and re-fetched as well.  To be safe, if the ROB detects that
+a grouped instruction caused a flush, the ROB will disable all instructions from grouping until a certain
+number of instructions are able to retire after the flush.  This number is currently set to the maximum ROB
+group size.
+
+=== Instruction Fusion
+To improve performance, certain pairs of instructions may be detected at decode and rename, and combined into
+a single operation which can be handled by the execution pipeline.  This has a few benefits:
+
+* Likely reduced execution latency by converting two operations into one
+* Reduced power from avoiding dispatch, issue, and execution of one instruction.
+
+.Fusion Pairs
+[options="header"]
+|===
+|First Instruction  | Second Instruction
+|LUI                | ADDI or ADDIW
+|AUIPC              | ADDI or ADDIW
+|AUIPC              | JALR
+|===
+
+If an eligible pair of instructions is detected, the first instruction will effectively be NOP'd in
+the pipeline and will not allocate any physical registers or update the Map Table. The second instruction
+will have its payload modified to indicate that the execution unit should perform the combined
+operation.
+
+Currently, instructions can only be fused if they are in the same decode group. It's expected that
+there may be a timing problem in the Rename stage if we allow the first instruction in ID to fuse with
+the last valid instruction in REN. This is because if the last instruction in REN is fused, then it needs
+to suppress allocating PRs and updating the Map Table.
+
+[[section-move-elimination]]
+=== Move-Elimination
+In some cases, software will want to copy the value of one register into another.  The RISC-V ISA defines
+a *mv* __rd__, __rs1__ pseudoinstruction which translates into *addi* __rd__, __rs1__, __0__.  This
+micro-architecture can be configured to add a hardware feature to optimize the execution of these move instructions.
+
+.Feature Overview
+Because this micro-architecture renames architectural registers to physical registers, this operation can be
+efficiently implemented by mapping multiple architectural registers to the same physical register.  Then
+the *mv* operation just turns into a Map Table update, and can be treated as a *NOP* at dispatch.  The Map Table
+entry for the destination AR will be written with the source PR index, instead of a new PR index allocated from
+the free list.  This is referred to as "eliminating" the move, or move-elimination.
+
+The complication is that because there are now multiple references to the same physical register, that physical
+register can only be returned to the free list after *all* references are obsolete. Consider the following code
+example:
+
+[source]
+----
+add x3, x1, x2     // allocates PR 2
+ld  x4, 0(x3)
+sub x3, x5, x4
+----
+
+The physical register allocated by the *add* (PR 2) will be returned to the free list after the *sub* instruction
+retires, because no instruction in-flight could possibly reference the result of the *add*.  Now consider a
+slightly different example with our move-elimination scheme:
+
+[source]
+----
+add  x3, x1, x2    // allocates PR 2
+ld   x4, 0(x3)
+mv   x6, x3        // creates second reference to PR 2
+sub  x3, x5, x4
+or   x7, x6, x8
+slli x6, x7, 2
+----
+
+Now, when the *sub* instruction retires, it cannot return PR 2 to the free list because the *or* instruction
+which depends on x6 will be told by the Map Table to read PR 2.  Only after the *slli* instruction retires
+is it safe to return PR 2 to the free list, because x6 no longer refers to PR 2.
+
+.Move-Elimination Mechanism
+Many schemes for move elimination rely on some form of reference counting.  A simple scheme would be to
+maintain reference counters per-physical register.  But this is expensive as the number of PRs scale up.
+{project-name} implements Move-Elimination by CAM'ing the Map Table after rename updates.
+
+During normal rename, an instruction will write to the Map Table and read out the previous PR index.
+The previous PR index is the one that is returned to the Free List when the instruction retires.
+In our scheme, after a Map Table update occurs, we CAM the Map Table with the previous PR index to see
+if any more references to that PR remain.  If no more references remain, then it is safe to return
+the previous PR index to the Free List after retirement. Each RHF entry is augmented with another field
+*returnToFL* which indicates that it is safe to return *prevPRIdx* to the Free List after retirement.
+It is possible that in a single cycle, multiple references to a PR are overwritten. There is checking
+within the Map Table to determine the youngest Map Table update that overwrite the PR index. This way only a
+single RHF entry will attempt to return that PR index to the Free List.
+
+Note that during rewind, the returnToFL field is not used.  During rewind the same CAMs are used to check
+for duplicate references again.
+
+=== Conditional Move Conversion
+The RISC-V ISA doesn't define any conditional move operations. So as a performance enhancement,
+a sequence of a conditional forward branch over a single move instruction is detected and converted
+into a conditional move. This may help in cases of unpredictable or data-dependent branches.
+The conditional move conversion turns a control dependency into a data dependency.  As a result, the
+execution of the move may in fact be delayed due to these extra real data dependencies.  However, the
+benefit is that if the predicate branch was indeed mispredicted by the frontend, no pipeline flush is
+necessary because the conditional move will return the correct result.
+
+.Move Conversion Mechanism
+In the ID stage, we check for this pair of instructions, and modify the payloads of the branch and
+move to affect their execution in IEX. The branch instruction is turned into a "predicate" operation,
+and the move is turned into a conditional move. A conditional move will have two
+extra dependencies: one on the predicate branch, and one on the previous value of the architectural
+register that the move is overwriting. The conditional move will use the predicate result to choose
+between returning the new move value or the old value.
+
+For more information on the conditional move handling, see <<Conditional Move Handling>>.
+
+=== Dispatch to Execution Units
+Instructions which require execution in one of the execution pipelines must be dispatched to an appropriate
+Issue Queue.  The instruction decoders will generate a bit-vector corresponding to the issue queues that
+this instruction may issue to (meaning that execution pipeline is capable of supporting this instruction).
+Some instructions (e.g. simple ALU instructions) may indicate that it can dispatch to multiple issue queues.
+Dispatch will consider this information, along with the credits available for each issue queue, to determine
+how the instructions should be steered to the issue queues.  Dispatch will try to load-balance the issue queues
+when possible.
+
+Instructions are broken into two categories for the purposes of the steering logic:
+
+* Statically-assigned: Instructions which are only supported on a single execution pipe, so must be dispatched
+to a specific queue.
+* Dynamically-assigned: Instructions which are supported on multiple execution pipes, so may be assigned to best
+balance the queues.
+
+==== Dispatch Flow Control
+Determining a target issue queue for an instruction to be dispatched to is a process from REN stage to ISS stage.
+The process takes the instruction, capability of the execution units, the dispatch buffer status, and the utilization
+of the issue queues into account. The following pipeline diagram is a P650 example showing how we dispatch instructions
+to the issue queues, and the associated annotations provide more details. Note that this example is not representative of
+all {project-name} configurations.
+
+image::pipeline_disp_iex_issq_upper.png[]
+[#PipelineOfDispInstToIssq]
+.P650 Pipeline of Dispatching Instructions to IEX Issue Queues
+image::pipeline_disp_iex_issq_lower.png[]
+
+. Pipe support information is determined when configuration time. For example, integer execution pipeline 0 supports
+simple arithmetic, SYS, and CMOV instructions on P650
+. According to the instructions and pipe support information, a bit-vector corresponding to the issue queues that this
+instruction may be issued to is generated for each instruction
+. Credit information from DIS stage indicates the utilization of the dispatch buffers, whereas credit information from
+ISS stage indicates the utilization of the issue queues
+. We currently use a Contention/Padding algorithm to decide which issue queue an instruction will be issued to
+. The steering logic controls the muxes by the selection signals of annotations 6, 7, 8, and 9, based on the information
+of the target pipe and buffer status
+. Selecting 1 payload out of the 4 payloads from REN to be filled into the dispatch buffer. No payload is selected if all
+payloads are selected by the entires with the lower index, or the entry is filled by the shifted payload from the entry with
+the higher index
+. Selecting the payload from the input payload and the shifted payload. The shifted payload has precedence over the input payload
+. Selecting the payload from the entries with the higher index if present. The muxes consider 4 entries at most because the
+maximum dispatch count is 4. Selection is done from the low indexes to the high indexes
+. Selecting the payload from REN stage (bypass path, 0 latency at DIS stage) or the dispatch buffer. Payload from the dispatch
+buffer has precedence over the payload from REN stage
+
+Note that when saying payload in annotations 6-8, it actually indicates {Payload, Target} in the diagram
+
+The credit scheme allows dispatch to know how many entries are available and determine how to best steer instructions
+to the issue queues. It would be possible for each queue to simply send a "full" signal to REN stage, but then REN
+stage would be less able to intelligently load-balance instructions in the issue queues.
+
+* Target determination will start with a number of credits equal to the number of entries in the queue
+* When an instruction is dispatched to the dispatch buffer or the issue queue, REN will decrement the credit count
+* When the issue queue releases an entry (because the entry was flushed, or issued and will not replay), a credit
+is returned to dispatch
+
+Note that after a pipeline redirect, multiple entries may be flushed in a single cycle. The queue will count
+the total number of released entries, and return the credits to REN as an encoded number. For performance,
+it's important the credits returned due to issuing instructions be returned to REN as soon as possible.
+However, after pipeline redirects, the dispatch buffer will be empty for some number of cycles so it is okay to return
+those credits a cycle or two after the redirect.
+
+===== Contention/Padding Algorithm for Issue Queue Selection
+As mentioned above along with the pipeline diagram of dispatching instructions to the issue queues, we are using Contention/Padding
+Algorithm at REN stage to determine which issue queue is the target to dispatch. For each instruction, here is how the algorithm works.
+
+. Checking the supported pipes, and generating a supported list designating the supported pipes
+. Checking if contention happens with the older instructions, and generating an index indicating how many older instructions conflict with the instruction
+. Sorting the supported list with the credits
+. Padding out the sorted supported list, or wrapping it at the nearest lower power of 2
+. Deciding the target pipe by the padded or wrapped list with the contention index
+
+For better understanding this algorithm, Here is a simple example.
+
+[#ExampleContentionPaddingAlgo]
+.Example of Contention/Padding Algorithm
+image::example_contention_padding_algo.png[]
+
+==== Dispatch Buffers
+The Dispatch Buffers are skid buffers used to absorb dispatching instructions when the Issue Queues do
+not have enough free entries.  This prevents stalls due to insufficient credits from propagating all the
+way back down to the frontend pipeline stages (the fetch buffers).
+
+The Dispatch buffers are configurable in a number of ways:
+
+* The number of entries (instructions) that may exist in the buffer
+* The number of Issue Queues that the dispatch buffer may dispatch to. Two different dispatch buffers must not
+dispatch to the same Issue Queue however (so that program order may be preserved at the Issue Queue)
+
+==== Dispatch Operand Wakeup
+Dispatch will provide information to the issue queues about the readiness of source operands. Immediate sources
+are always seen as ready, but register sources may still depend on older instructions to execute.
+
+<<<
+== Integer Execution Unit
+The Integer Execution Unit consists of the Issue Queues, the Integer Physical Register File (IRF), the integer
+execution units (ALUs, multipliers, dividers), and operand bypassing datapaths.  There is a single IRF, but
+a configurable number and type of parallel execution pipelines.  A high-level diagram for a single execution
+pipeline is given below.
+
+[#IntegerExecutionPipe]
+.Integer Execution Pipe
+image::integer_pipe.png[]
+
+The general flow for instructions to be executed in the pipeline is as follows:
+
+* In DIS stage, an instruction will be dispatched into the Issue Queue to wait for operands
+* In ISS stage, the Issue Queue will select a ready instruction and wakeup any dependent instructions from this
+and other execution pipes
+* In RR stage, the source operands will be read from the IRF (if needed). Any immediate values and control signals
+needed for execution will also be generated.  The final input operands will be selected from the IRF, immediate,
+or bypassed results.
+* In EX stage, the instruction's result is calculated. For multiply and divide instructions, the computation begins.
+* In WB stage, the result is written back to the IRF, and a completion indication is sent to the ROB.
+
+The sections below discuss each of these in more detail.
+
+=== Integer Physical Register File
+The Integer Physical Register File (IRF) is a unified structure for storing the general purpose x-register
+values, both the architectural state and the speculative in-flight results.  The use of a single unified
+structure, as opposed to separating the committed architectural values from the speculative values,
+reduces energy by avoiding copying from one structure to another after an instruction has been committed.
+
+Because the IRF is the only place where register values are stored, it must service all of the execution units
+that need to read register values.  This means that the IRF is a highly ported structure with, in general, two
+read ports and one write port per execution pipeline.
+
+==== IRF Physical Register Ready Array (PRA)
+The readiness of values in the IRF is tracked using a bit-vector (1 bit per IRF entry) which is maintained in
+dispatch.  These ready bits are set and cleared as follows:
+
+* When a PR is allocated to an instruction, at the end of REN stage the PR index is decoded and is used as a
+bit mask to clear the ready bit. This is done at the end of REN stage so that we don't need a clear-to-read
+bypass in DIS stage to prevent a younger instruction from seeing the PR as ready when an older instruction is
+clearing the ready bit.
+* When an instruction writes back to the IRF, the destination PR index is decoded and is used as a bit mask
+to set the ready bit.
+
+Instructions in dispatch which have register dependencies will use the source PR indexes provided by the
+Map Table to read the PRA.  This will indicate whether the source PR is ready at the time of dispatch.
+If the ready bit is not set, then the producing instruction is still in flight. After dispatch,
+the source readiness is determined through tag broadcasts (see <<Operand Wakeup>> for details).
+
+Note that instructions in dispatch will also have to monitor the tag broadcasts, to provide a write-to-read
+bypass of the ready vector.  The issue queues will handle monitoring tag broadcasts for instructions dispatching
+to the queue.
+
+==== IRF Datapath
+The IRF receives the indices to read from each execution pipeline at the end of the Issue stage.  For each
+read index, it will be flopped into the Register Read stage and then used to mux out the appropriate entry.
+Each read index in the issue stage also comes with a valid bit to indicate whether that source must be
+read from the IRF.  If an instruction does not read a register, or will bypass from the execution pipelines,
+the read index flops will not be enabled in order to save power from toggling the read muxes.
+
+In order to tune for timing, a configurable number of read index bits may be decoded at the end of the Issue
+stage.  This will make the read mux in RR stage faster, at the expense of more flops for the decoded
+values.
+
+==== IRF Zero PR
+The architected register x0 is defined by the ISA as being hardwired to zero.  Entry number 0 of the IRF
+serves this purpose and is hardwired to the value zero.  PR zero will never be allocated by the free list
+as the destination PR for an instruction.
+
+=== Issue Queues
+The Issue Queues are responsible for buffering instructions as they wait for input operands to
+become ready.  A dispatching instruction will be allocated into one entry of the Issue Queue.
+Once an entry's operands are all ready, and there are no issue blocking conditions, that entry will
+set its ready bit and wait to be selected.
+
+.Build-time Configuration Parameters
+The Issue Queues are configurable at build time with a few parameters:
+
+* The number of entries
+* The number of dispatch ports into the queue (realistically expected to be 1 or 2)
+* Issue selection policy: FIFO-ordered, oldest ready first, any ready (static priority based on index of entry)
+* Support for branch/jump instructions
+* Support for multiply instructions
+* Support for divide instructions
+
+The parameters for supporting different types of instructions are to allow for optimization and removal of logic.
+
+==== Entry Allocation
+The entry allocation policy depends on the configured issue selection policy. Note that if there are multiple
+dispatch ports (numbered 0 to N-1), they will always be age-ordered such that the instruction on port 0 is
+oldest, then port 1, etc...  This allows the Issue Queue to properly maintain information about the relative
+age of entries.
+
+.FIFO-ordered
+Standard read and write pointers are used to allocate entries.  The read pointer will advance when the oldest
+entry is being released, and the write pointers advance as instructions are dispatched.
+
+.Not FIFO-ordered
+A bit-vector is used to keep track of valid (and allocated) entries, essentially a free list.
+A find-first priority search is done on the bit vector to find an invalid entry.  Depending on the number
+of configured dispatch ports, multiple find-first searches will be done.  The first search will be starting
+from entry 0.  The second search will be starting from entry N-1 (for N entries).  A third search will
+start from entry 1, and mask out the result of the first search.
+
+When entries are released, the valid bits are cleared and the entry becomes available for dispatch again.
+
+Note that we don't need to explicitly detect
+cases where the multiple searches select the same entry, because near-full conditions will be handled by
+the credit scheme described above, and dispatch will know not to send too many instructions.
+
+==== Age Matrix
+When an Issue Queue is configured to select the *oldest* ready instruction, an age matrix is used to determine
+the relative age between every pair of entries in the queue.  The age matrix is encoded as a 2-D vector
+in a manner described below.  Note that because "entry __y__ is older than __x__" also implies "entry __x__ is not
+older than __y__", half of the matrix is redundant.  And an entry cannot be older than itself, so the
+diagonal is also not useful. However for simplicity the diagonal bits can be represented as constant 1.
+
+[source]
+----
+Age matrix encoding (assuming 4 entries):
+
+age[y][x] == 1 implies entry x is older than entry y
+  a  '.' indicates that bit is redundant or not useful
+  an 'x' indicates that bit is useful and must be tracked
+             x
+           [3:0]
+    age[3] ....
+y   age[2] x...
+    age[1] xx..
+    age[0] xxx.
+----
+
+Note that for __y__ > __x__, age[__y__][__x__] is simply ~age[__x__][__y__].
+
+Dispatch will never send instructions out of program order to the same Issue Queue. So when an entry
+is allocated for a dispatching instruction, it is younger than all other valid entries.  The row of the age matrix
+associated with the allocated entry will be reset to zeros.  When an entry is released, all other valid entries
+become older than the releasing entry, so the column of the age matrix associated with that entry is set to ones.
+
+If the Issue Queue is configured to be FIFO-ordered, or simply select the first ready instruction starting from
+entry 0, the age matrix will not be generated and the selection logic will be optimized.
+
+==== Entry State
+Each Issue Queue entry maintains state which allows the entry to track the readiness of operands, along with
+other control bits and a payload used for execution.  Some state fields only apply to certain configurations
+of Issue Queue, and these will be noted.  The format of the payload also depends on the type of the
+instruction.
+
+.Per-entry state
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|valid      | Valid bit for entry
+|ready      | Ready bit for entry
+|older_vec  | Row of age matrix for this entry (only for oldest-ready configuration)
+|payload    | Payload for execution
+|latency    | Instruction latency (in cycles)
+|srcValid[] | Bit per-source to indicate source is a register value (not immediate)
+|srcReady[] | Bit per-source to indicate value of source will be ready (in IRF, bypassable, or immediate)
+|srcPR[]    | Per-source PR index
+|destValid  | Instruction writes to IRF
+|destPR     | Destination PR Index
+|===
+
+==== Payload Formats
+The format of the payload field depends on the type of instruction.  Part of the payload is common to all
+instructions (the Common Payload), and the rest of the payload may differ (the bits are overloaded).
+The alu_opc field of the common payload allows the execution pipeline to interpret the rest of the
+payload and generate the correct pipeline controls.
+
+.Common Payload
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|gid        | ROB Group ID
+|op         | Encoded Instruction type
+|===
+
+.Overloaded Branch/JAL Payload
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|predTkn    | Branch was predicted taken
+|brqIdx     | Branch Resolution Queue Index
+|rhfWrPtr   | RHF write pointer to restore to if mispredicted
+|pcmtIdx    | PC Map Table Entry containing MSBs of PC
+|pcLow      | LSBs of PC
+|offset     | 12-bit offset
+|===
+
+.Overloaded JALR Payload
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|predTkn    | Jump was Predicted taken
+|brqIdx     | Branch Resolution Queue Index
+|rhfWrPtr   | RHF write pointer to restore to if mispredicted
+|tgtPcmtIdx | PC Map Table entry containing MSBs of predicted target
+|tgtPCLow   | LSBs of predicted target
+|offset     | 12-bit offset
+|===
+
+.Overloaded Other Payload
+[options="header"]
+[cols="1,3"]
+|===
+|Field      | Description
+|imm        | 12-bit immediate
+|===
+
+==== Operand Wakeup
+Each entry in the Issue Queue has logic to monitor the readiness of its input operands.  When an instruction
+is selected for issue, its destination PR tag, a valid bit (indicating the instruction writes to a PR), and the
+latency of the result is broadcast to all entries in the same issue queue (and to all other integer issue queues)
+two cycles before the result data forwards on the operand bypass network.
+Each entry will monitor these broadcasts to determine when all input operands will speculatively be ready.  Readiness
+may be speculative because the producing instruction may replay. When all operands are either known to be ready,
+or speculated as ready, and no issue block conditions are in place, then the entry will set its ready bit to one
+on the next cycle so that it may be selected for issue.
+
+Note that it is critical for performance to be able to execute dependent instructions in back-to-back cycles. This
+creates a single-cycle select -> broadcast -> wakeup loop which is generally very timing critical.  This timing problem
+scales with the number of broadcasts per cycle and the total number of issue queue entries
+
+Note that if an Issue Queue is only used for instructions which have latency greater than 1, then this single-cycle loop
+is not required, and the issue selection and operand wakeup can be in separate pipeline stages to relieve timing
+pressure.
+
+.Multi-cycle instructions
+Some instructions, such as multiplies and divides, take multiple cycles to compute the result.  The dependent instruction
+should not be issued unless the multi-cycle result will be available for bypass, or in the IRF.  For these multi-cycle
+instructions, the tag broadcast will occur after the issue cycle, and will be muxed in with the single-cycle tag broadcasts
+such that only a single broadcast will come from each execution pipeline.  The issue queue will prevent shorter latency
+instructions from issuing and requiring a tag broadcast in the same cycle that a multi-cycle latency instruction requires
+a tag broadcast.
+
+Even the divider will use the single tag broadcast.  But since the divider is variable latency, it will be required to
+assert a signal several cycles before completing so that the tag may be broadcast at the appropriate cycle for dependent
+instructions to forward the result as early as possible.
+
+==== Instruction Replay
+Because load instructions are speculated to hit in the DTLB and L1 D-Cache, we will speculatively wake up dependent
+instructions.  These dependent instructions will be issued, and already in the execution pipe by the time
+the load is determined to hit or miss.  In addition, these dependent instructions may in turn wake up more
+instructions and cause them to be issued. In the event of a miss, the chain of dependent instructions must be replayed and
+attempted again later when the miss is resolved.
+
+To keep the replay simple, the Issue Queue entry allocated by an instruction will not be released until it is known
+that the instruction will not replay.
+
+[#SrcTagBroadcastReplay]
+.Operand Tag Broadcast Wakeup Replay Bypass
+image::wakeup_replay.svg[]
+
+==== Issue Blocking Conditions
+There are certain scenarios in which we need to prevent an instruction from being issued by the Issue Queue,
+generally due to structural hazards on shared resources such as IRF read or write ports.  These blocking
+conditions will be detected one cycle ahead of time, and the ready bits for the affected entries will be forced to zero
+for the next cycle to prevent the selection logic from selecting any instruction.
+
+.Possible Blocking Conditions
+* A floating point instruction needs to inject an operation into the execution pipeline tied to this
+queue. Block all entries.
+* A CSR access instruction needs to inject an operation into the execution pipeline tied to this queue. Block all entries.
+* A multi-cycle instruction executing on this pipeline will cause a conflict in the WB stage. Block all entries that
+will have conflict (depends on instruction latency).
+* An entry issued but may replay. We need to prevent the entry from repeatedly issuing. Block that entry (but multiple
+entries may be in this state in a given cycle).
+* An instruction requires a non-pipelined execution unit that is busy.  Block all entries that require that unit.
+* The ROB is about to cause a pipeline flush. Block branches from issuing so that a branch mispredict does not cause
+a pipeline rewind which may delay the ROB pipeline flush.
+
+See <<Injected ALU Operations>> for more details on the first two cases.
+
+.Multi-cycle Instructions
+Multi-cycle instructions are broken into two categories: those with a fixed known latency (e.g. multiplies), and
+those with a variable latency (e.g. divides).
+
+For fixed-latency instructions, the latency of the instruction is
+provided as part of the payload.  If the latency is greater than 1 cycle, the Issue Queue will maintain a small
+scoreboard to know when writeback conflicts will occur.  For example, assume a multiply instruction issues with a
+latency of 3. During the cycle the multiply is issuing, we know that 2-cycle instructions must not be issued on the
+next cycle, so an entry with a latency of 2 will clear its ready bit for the next cycle.  On the cycle after the
+multiply issues, instructions with latency of 1 should clear their ready bits for the next cycle.
+
+Currently the only variable latency (non-load/store) instruction is a divide-type instruction. The Issue Queue
+relies on the divider to send a signal indicating not to issue an instruction on the next cycle.  See
+<<Divider Writeback Hazard>> for more details.
+
+==== Instruction Selection
+The selection logic will depend on some of the configurable parameters.  The logic for the different configurations
+is detailed below.  <<IssueDatapath>> illustrates the datapath for selecting an instruction to issue, the main difference
+between the different configurations is in the logic to generate the mux select signals (not shown).
+
+.FIFO-Ordered
+When an Issue Queue is configured as FIFO-ordered, a simple read pointer is used to mux out the next entry to be
+issued.  The read pointer will advance when the entry pointed to is ready.
+
+Note that to avoid complicated pointer management, instructions which may replay should not be issued. Generally
+the FIFO-ordered issue queues will not be used in performance critical areas.  They work well for things like handling
+system instructions which access state which is not renamed (such as CSRs), and therefore must be serialized.
+
+.First-ready from entry 0
+This selection policy implements a priority-mux, where the priority is tied to the index
+of the entry. The priority order is from entry 0 (highest) to entry N-1 (lowest).  The upside is that the selection
+mux has the fewest levels of logic, but younger instructions may be issued first.  Technically, it's possible that
+the younger instruction was on the more critical dependency path, but in general the oldest-first policy performs
+better (assuming frequency is not impacted).
+
+.Oldest-ready
+The oldest-ready selection policy will guarantee that if multiple instructions are ready, the oldest in program order
+will be selected first.  This is achieved with the use of the age matrix described in <<Age Matrix>>.
+
+The selection mux is implemented hierarchically with 2:1 muxes to achieve good timing.  For example, in the first level
+of mux, the select signal only depends on the relative age of those two entries.  In the second level, only the relative
+age among four entries needs to be in the cone of the select signal.  So the larger cones of logic are fed into the
+later mux stages.  An example pseudo-code in verilog is presented below (assuming 4 entries, and just a single payload bit):
+
+[source]
+----
+wire [3:0]       ready;
+wire [3:0] [3:0] older;    // age matrix, older[y][x] means entry y older than entry x
+wire [3:0]       payload;  // payload bit
+
+// First level of 2:1 mux
+wire [1:0] sel_lv1;    // select signals
+wire [1:0] mux_lv1;    // mux outputs
+
+assign sel_lv1[0] = (ready[1] & older[1][0]) | ~ready[0];
+assign sel_lv1[1] = (ready[3] & older[3][2]) | ~ready[2];
+
+assign mux_lv1[0] = sel_lv1[0] ? payload[1] : payload[0];
+assign mux_lv1[1] = sel_lv1[1] ? payload[3] : payload[2];
+
+// second level of 2:1 mux
+wire sel_lv2;   // select signal
+wire mux_lv2;   // mux output
+
+assign sel_lv2 = ((ready[3] & older[3][1]) | (ready[2] & older[2][1]) | ~ready[1]) &
+                 ((ready[3] & older[3][0]) | (ready[2] & older[2][0]) | ~ready[0]);
+
+assign mux_lv2 = sel_lv2 ? mux_lv1[1] : mux_lv1[0];
+----
+
+For execution pipes which can receive injected operations, the issue selection mux is extended with an
+extra input that is fed from the injection interface, as shown in the diagram below.  As detailed in
+<<Issue Blocking Conditions>>, an issue block signal will be sent a cycle before the injected operation is
+presented on that interface, so all of the ready bits for the issue queue entries should be de-asserted, and
+the muxes will choose the injected operation.
+
+[#IssueDatapath]
+.Issue Selection Datapath
+image::issue_selection.png[]
+
+==== Cross-Issue
+Each Issue Queue is normally associated with a single execution pipeline. This can lead to an underutilization of
+execution resources in the case where a single Issue Queue has two more more ready instructions, and another Issue
+Queue has no ready instructions. {project-name} includes a configurable option to support issuing an instruction
+from one Issue Queue to a separate execution pipeline.  This is referred to as "cross-issue".
+
+When instructions are in ID stage, the RDU detects all of the execution pipelines that support that instruction.
+As part of the dispatch payload, there is a *crossOk* field which indicates that this instruction is supported on
+all pipes.  When an Issue Queue A is configured to support cross-issue, there will be two issue ports: the normal one
+for the associated execution pipeline, and a second port which goes to another Issue Queue B. This second issue port
+will only select among ready entries which are marked as *crossOk*. The issue selection mux in Issue Queue B
+will then have one more input which comes from Issue Queue A. The input cross-issuing instruction has the
+lowest priority and will only be selected if Issue Queue B has no ready instructions.
+
+An Issue Queue which can cross-issue will also need to observe the replay signals from the other execution pipeline.
+When an Issue Queue entry is issued, it records whether it was issued on the first or the second port. The entry
+will then monitor the appropriate replay signals.
+
+Cross-Issue can be disabled through the <<Chicken Bits>>. In this case, the RDU will force the *crossOk* payload
+bit to zero for every instruction.
+
+=== Operand Bypassing
+In order to increase performance, instructions will be able to bypass input operands directly from various
+stages of the execution pipeline.  Due to the difference in timing criticality of the different bypassing
+sources, the bypass muxes are structured hierarchically in levels, with late-arriving inputs brought in
+to later levels of muxes.  The diagram below illustrates the organization of the bypass muxing.  The most critical
+signals are expected to be the single-cycle ALU results from EX stage, the load results, and the IRF read
+data.
+
+.Operand Bypass Datapath
+image::operand_bypass.png[]
+
+=== ALU
+The ALU resides in the EX stage of the pipeline.  It handles the computation of arithmetic, logical,
+shift, and compare operations defined in the base RV64I instruction set.  Each ALU may be configured
+to support branches and jumps as well.  All ALU operations execute in a single cycle.
+
+==== Standard ALU Operations
+The table below lists the instructions which are executed by the ALU, and where the input operand(s) are
+sourced from (rs<x> for register source, imm for a generated immediate, pc for PC, 0 for zero, or X for don't-care).
+Note that the immediates may be generated in multiple ways, depending on the type of instruction.
+For example, JAL has a 20-bit immediate, while ADDI only has a 12-bit immediate, and LUI has a 20-bit
+immediate which is placed into bits [31:12] of the operand.
+
+.Supported ALU operations
+[options="header"]
+[cols="1,1,1,1,3"]
+|===
+|Instruction | source 1 | source 2 | ALU operation | Notes
+|ADD(I)      | rs1      | rs2(imm) | add           |
+|SLT(I)      | rs1      | rs2(imm) | sub           |
+|SLT(I)U     | rs1      | rs2(imm) | sub           |
+|XOR(I)      | rs1      | rs2(imm) | xor           |
+|OR(I)       | rs1      | rs2(imm) | or            |
+|AND(I)      | rs1      | rs2(imm) | and           |
+|SLL(I)      | rs1      | rs2(imm) | shift-left    |
+|SRL(I)      | rs1      | rs2(imm) | shift-right   |
+|SRA(I)      | rs1      | rs2(imm) | shift-right   |
+|LUI         | 0        | imm      | add           | imm already placed in upper bits
+|AUIPC       | pc       | imm      | add           |
+|JAL         | 0        | imm      | add           | imm is pre-computed PC+2/4
+|JALR        | rs1      | imm      | add           | to compute target
+|BEQ         | rs1      | rs2      | ==            | to compute condition
+|BNE         | rs1      | rs2      | ==            | to compute condition
+|BLT         | rs1      | rs2      | sub           | to compute condition
+|BLTU        | rs1      | rs2      | sub           | to compute condition
+|BGE         | rs1      | rs2      | sub           | to compute condition
+|BGEU        | rs1      | rs2      | sub           | to compute condition
+|===
+
+==== Branch Resolution
+If an ALU is configured to support branch/jump instructions, it will include hardware for
+resolving the direction and target of a branch or jump instruction and detect any mispredictions.
+
+Branches and jumps may need to perform one or more of the following operations:
+
+* Compare two operand values
+* Compute a target address
+* Compute a link value
+
+Because of this, an execution pipe configured to support branch resolution will include a dedicated
+adder in the RR stage for pre-computing either a target address or a link value.  The ALU will perform
+either the comparison or computing a target address.
+
+.Conditional Branch Instructions
+All conditional branches encode a signed offset[12:1] field (for +/- 4KB range).  Because the target is
+PC-relative, the frontend can precisely calculate the target and therefore cannot mispredict on the target
+of the branch.  The dedicated adder in RR stage will compute the target PC to redirect to in case of a direction
+misprediction: PC+2/4 if predicted taken, PC+imm if predicted not-taken.  The ALU will compute the direction
+of the branch by comparing two operand values.  If the computed direction is different than the predicted direction,
+a redirect will taken to the pre-computed target PC.
+
+.JAL Instructions
+The JAL instruction is unconditional and has a PC-relative target with a signed 20-bit offset. Similar to
+conditional branches, because the target is PC-relative the frontend cannot mispredict the target. In
+addition the JAL is unconditional, so the frontend cannot mispredict the direction. The dedicated adder in RR
+stage will compute the link value (PC+2/4). The ALU will simply pass-through the link value by adding
+the link value with 0.
+
+.JALR Instructions
+The JALR instruction is unconditional and has a target given by a register value, plus a signed 12-bit offset.
+Because the target depends on a register value, the frontend can mispredict the target.  The dedicated
+adder in the RR stage will pre-compute the link value. The ALU will compute the real target, and compare it
+with the predicted target.  If the targets mismatch, a redirect will be taken.  The pre-computed link value
+will be selected as the ALU result.  In some circumstances, a JALR instruction will not be predicted as taken
+in the Fetch Unit.  The predTkn payload bit will be zero, and in this case a flush will always be generated.
+
+In order to minimize the branch misprediction penalty, the branch resolution logic will have a direct interface
+to the fetch unit to signal a misprediction and provide the correct target. It is unlikely that timing will be
+met if the pipeline redirects the fetch unit at the end of EX stage, so the
+misprediction indication and target will be staged into WB and then sent to the fetch unit.
+
+Regardless of whether the branch or jump mispredicted, it must also signal to the BRQ and the ROB that the
+branch was executed and resolved.
+
+.Branch Resolution Interface
+[options="header"]
+[cols="1,3"]
+|===
+|Signal      | Description
+|redirValid  | If asserted, redirect the pipeline
+|redirTgt    | Target PC of redirect
+|rhfWrPtr    | RHF write pointer to restore to
+|predCorrect | Prediction was correct
+|gid         | ROB group ID of branch/jump
+|brqIdx      | Branch Resolution Queue Index
+|===
+
+==== Injected ALU Operations
+There are special instructions which are not standard ALU operations, but end up being injected into
+an ALU execution pipeline to read and/or write the IRF, and maybe perform some minimal operation. These
+are floating point converts/move/compares which write an integer register, and CSR accesses which
+write to an integer register.
+
+See <<Floating Point Transfer Operations>> for more detail about the flow of these floating point
+operations, and <<CSR Accesses>> for detail on the CSR operations.
+
+.Injected ALU operations
+[options="header"]
+[cols="2,1,1,1,2"]
+|===
+|Injecting operation           | source 1  | source 2 | ALU operation | Notes
+|floating point -> integer op  | FP value  | 0        | add           |
+|CSRR{W,S,C}[I]                | CSR value | 0        | add           | return rs1 to system unit
+|===
+
+The execution pipeline which can receive injections from the floating point unit or the system unit will
+have an interface to receive an input value (used as source 1).  Additionally, the execution pipeline
+will return a value to the system unit.
+
+A given execution pipeline will only be able to support injected operations from one source.  This is to
+avoid having to coordinate between the multiple injection sources (the floating point issue queue and the
+system issue queue) in the event that both want to inject at the same time.  It is expected that the
+core will be configured with at least two integer ALUs, so this should not be a problem.
+
+=== Integer Multiplier
+The integer multiplier is fully pipelined, and mapped into the same execution pipeline as one of the
+ALUs.  This means that the multiplier and paired ALU will share one writeback port, and structural hazards
+must be avoided.
+
+.Supported Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction   | Operation
+|MUL           | Compute rs1 * rs2. Return lower XLEN bits
+|MULH          | Compute rs1 * rs2 as signed * signed. Return upper XLEN bits
+|MULHU         | Compute rs1 * rs2 as unsigned * unsigned. Return upper XLEN bits
+|MULHSU        | Compute rs1 * rs2 as signed * unsigned. Return upper XLEN bits
+|===
+
+.RV64-only Supported Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction   | Operation
+|MULW          | Compute rs1 * rs2 using lower 32 bits of each. Sign extend low 32 bits of result to 64 bits.
+|===
+
+==== Multiplier Writeback Hazard
+The latency of all multiply instructions is known at issue time. The Issue Queue will internally handle
+preventing writeback hazards.  See <<Issue Blocking Conditions>> for more details.
+
+=== Integer Divider
+The integer divider is a multi-cycle, un-pipelined, iterative divider with early exit detection.  The
+divider is configurable in the number of quotient bits which are computed per cycle. If included,
+the divider will be mapped into the same execution pipeline as one of the ALUs.  This means that the divider
+and paired ALU will share one writeback port, and structural hazards must be avoided.
+
+.Supported Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction   | Operation
+|DIV           | Compute signed rs1 / rs2 as an XLEN bit operation. Round towards zero.
+|DIVU          | Compute unsigned rs1 / rs2 as an XLEN bit operation. Round towards zero.
+|REM           | Compute remainder of DIV operation.
+|REMU          | Compute remained of DIVU operation.
+|===
+
+.RV64-only Supported Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction   | Operation
+|DIVW          | Compute signed rs1 / rs2 using lower 32 bits of each. Sign extend to 64 bits.
+|DIVUW         | Compute unsigned rs1 / rs2 using lower 32 bits of each. Sign extend to 64 bits.
+|REMW          | Compute remainder of DIV operation. Sign extend to 64 bits.
+|REMUW         | Compute remained of DIVU operation. Sign extend to 64 bits.
+|===
+
+==== Divider Writeback Hazard
+To avoid structural hazards on the writeback port, the issue queue will try to prevent issuing an
+instruction which will occupy writeback in the same cycle as the divide.  The cycle diagram below
+illustrates the condition in which a single-cycle instruction would have a writeback hazard with a
+divide.  If a single-cycle instruction issues 3 cycles before the divide writeback, then a conflict
+will occur.  So the divider will try to identify 4 cycles ahead (in WB-4) that the result will
+be ready, and send a signal to block issue for the next cycle.
+
+Because of the early-exit capability, a divide may currently complete in a minimum of 5 cycles (normal
+EX stage is cycle 1, WB is cycle 5).  This means that the conditions for completing in the minimum number
+of cycles must be detected in the first cycle, and then an issue block sent to the issue queue.
+
+.Divide Conflict Timing
+image::divide_timing1.png[]
+
+==== Divider Result Bypass
+The divide result will be available for bypass in the WB cycle of the divide.  The cycle diagram below
+illustrates the earliest possible bypassing conditions for an instruction dependent on the divide.
+The dependent op must issue 1 cycle before the divide is in WB, so the dependent instruction must
+be woken up 2 cycles before the divide is in WB.  The divider will determine 2 cycles ahead (in WB-2) that
+the result will be ready, and will broadcast its destination PR index to the issue queues.
+
+.Divide Bypass Timing
+image::divide_timing2.png[]
+
+=== Conditional Move Handling
+The conditional move conversion feature is split between the RDU and IEX.  The RDU will detect
+sequences of conditional forward branches over a single move instruction, and modify their payloads
+as described in <<Conditional Move Conversion>>.  IEX will then execute them in a slightly modified
+manner.  To support this, another structure called the CMOV Predicate Array is added to IEX.
+
+.CMOV Predicate Array
+The result of the predicate branch needs to be made available to the conditional move. To avoid coupling
+the execution of the branch and move, such as by forcing them to issue in back-to-back cycles, a Predicate
+Array is added to IEX.  The Predicate Array is similar to the IRF, but each entry is only
+a single bit wide to store a predicate bit for the move (whether the move should return new or old data).
+The Predicate Array is not a free-listed structure, instead it is indexed by ROB entry number of the move.
+
+The Predicate Array has a write port for each execution pipeline which supports resolving conditional
+branches.  And it has read ports for each execution pipeline which supports cmov operations.  The
+Predicate Array also has an associated Ready Array, similar to the IRF.
+
+Having one bit per ROB entry is sufficient because an ROB group can have at most one conditional branch.
+Using the ROB entry number of the move allows the branch to execute and retire if for some reason the
+move instruction is held up.  The only tricky thing is that we cannot allow the branch to dispatch
+into the last available ROB entry and accidentally overwrite the predicate bit for an older instruction.
+This case is detected in Dispatch and will stall the dispatch of the conditional branch. But since the ROB
+must be close to full anyway, it's not expected that it will cause much performance impact.
+
+.Executing the Predicate Branch
+The predicate branch is executed and resolved as a normal conditional branch, except for a few things:
+
+* If predicted incorrectly, the branch will not cause a pipeline flush.
+* When issuing, the branch will broadcast the ROB entry number of the move onto the predicate source
+bus.
+* At the end of EX and WB stages, it will forward the predicate value. At WB it will write to the
+Predicate Array, and also set the ready bit in the Ready Array.
+* When training the BDP, a predicate branch will force the training to be toward not-taken.
+
+The BDP training is forced as not-taken because the conditional move conversion can only happen
+if the Fetch Unit predicts the branch as not-taken.  If the branch is predicted as taken then
+the move instruction will be skipped and not executed.
+
+.Executing the Conditional Move
+The conditional move will now have three sources to wait for in the issue queue:
+
+* The original register source.
+* The previous value of the architectural register being overwritten.
+* The branch predicate result.
+
+Once all three are ready, or speculated to be ready, the move will issue.  In the EX stage,
+the move operation is modified to become a conditional select instruction.  If the predicate
+is true (meaning the branch was not taken), the move will return the new value. Otherwise
+the move returns the previous register value.
+
+.Potential Future Improvements
+Performance may actually degrade if the conditional forward branch is highly predictable.
+So it may be worth adding a widget to check how accurately we are predicting these branches
+and dynamically disable the optimization. Exactly how to do this has not been figured out yet.
+
+<<<
+== Load/Store Unit
+Description of {project-name} LSU can be found in the link below:
+
+https://github.com/sifive/arch-specs/blob/master/core/mallard_lsu_mas.adoc[Mallard LSU MAS]
+
+<<<
+== Floating Point Execution Unit
+The Floating Point Execution Unit consists of the Issue Queues, the Floating Point Physical Register File
+(FRF), the individual floating point computation logic (arithmetic, multiply, divide, etc...), and operand
+bypassing datapaths.  There is a single FRF, but a configurable number and type of parallel execution
+pipelines.  A high-level diagram for a single execution pipeline is given below.
+
+TODO: Diagram of floating point execution pipe.
+
+=== Floating Point Physical Register File
+The Floating Point Physical Register File (FRF) uses the same configurable register file module as the
+Integer Register File.  See <<Integer Physical Register File>> for more details.
+
+The main difference is that floating point register zero (f0) is not hardwire to zero.
+
+=== Floating Point Issue Queues
+The floating point issue queues use the same configurable issue queue module as the Integer issue queues.
+See <<Issue Queues>> for more details.
+
+The main difference is that floating point instructions generally have a latency of multiple cycles, but this
+is handled with the same mechanisms that support integer multiplies and divides.
+
+=== Floating Point Execution Units
+TODO: Describe the various types of floating point units here.
+
+=== Floating Point Transfer Operations
+The RISC-V ISA defines instructions which read integer registers and write floating point registers, and vice versa.
+There are three categories of such instructions:
+
+* Move between integer and floating point register
+* Convert between integer and floating point formats
+* Floating point comparison instructions
+
+The micro-architecture separates the floating point and integer execution pipelines, such that instructions
+dispatched to the floating point issue queues don't have a direct datapath to read and write back to the IRF.
+The same thing holds for instructions dispatched to the integer issue queues not being able to directly access
+the FRF.  So the categories of instructions above have some special handling in the pipeline to coordinate
+movement of data between the floating point and integer units.  The following sections describe how these
+operations are handled.
+
+In both cases, the best case latency between a move/convert/compare and a younger dependent instruction is 3 cycles.
+It's possible that this could be improved, but the critical path is expected to be from issuing one of these instructions
+in the floating point/integer issue queues, to generating an issue block in the other type of issue queue.
+
+In general, moves and conversions may not be so performance-critical, but branches based on floating point compares
+need to be kept in mind.  Where possible, the latency from a floating point compare to a conditional branch
+should be kept to a minimum.
+
+==== Floating Point to Integer Operations
+The table below lists the operations which read floating point registers and write to integer registers.
+
+.Floating Point to Integer Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction        | Description
+|FCVT.W[U].{S,D}    | Convert from Single/Double to signed/[unsigned] 32-bit integer
+|FCVT.L[U].{S,D}    | Convert from Single/Double to signed/[unsigned] 64-bit integer
+|FMV.X.{W,D}        | Move Single/Double into lower 32 bits of rd, sign-extend for RV64
+|FCLASS.{S,D}       | Classify Single/Double, write result to integer register
+|F{EQ,LT,LE}.{S,D}  | Compare two Singles/Doubles, write 1 or 0 to integer register
+|===
+
+All of the above operations are handled in with the same micro-architectural flow. The cycle timing diagram below
+helps to illustrate the following process:
+
+* The floating point operation will be dispatched to a floating point Issue Queue.
+* When the floating point source operands are ready, it will be issued into a floating point execution pipeline
+ to read the FRF.
+* When the floating point op is in RR stage, an issue block signal will be sent to the integer issue queue so that
+no entries get issued on the next cycle.
+* When the floating point op is in EX stage, the appropriate operation is performed (convert, move, classify, compare).
+* In the same EX stage, a move operation is injected into the ISS stage of the integer issue queue. A dependent
+integer instruction may be woken up in this cycle.
+* When the floating point op is in the WB stage, no writeback is performed on the FRF.  Instead the result of the
+floating point operation is forwarded to the injected move operation (now in RR stage in the integer pipe). A dependent
+integer operation may issue in this cycle.
+* The injected move operations and dependent operations proceed through the EX and WB stages as normal.
+
+////
+* Using an interface to one integer Issue Queue, a signal will be sent to block the issue of instructions from that
+queue for one cycle.
+* During the blocked issue cycle, a move operation will be injected into the issue selection mux of the integer
+Issue Queue (the selection mux has one dedicated input for these move injections).
+The destination PR index assigned to the move will be broadcast on the normal operand wakeup interface to wakeup
+any dependent integer operations.
+* The move operation will go down the execution pipeline, intercept the value read from the FRF, and write to the IRF.
+////
+
+.Floating Point to Integer Timing
+image::fp_move_timing1.png[]
+
+==== Integer to Floating Point Operations
+The table below lists the operations which read integer registers and write to floating point registers.
+
+.Integer to Floating Point Operations
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction       | Description
+|FCVT.{S,D}.W[U]   | Convert to Single/Double from signed/[unsigned] 32-bit integer
+|FCVT.{S,D}.L[U]   | Convert to Single/Double from signed/[unsigned] 64-bit integer
+|FMV.{W,D}.X       | Move Single/Double into lower 32 bits of rd, sign-extend for RV64
+|===
+
+All of the above operations are handled in with the same micro-architectural flow. The cycle timing diagram below
+helps to illustrate the following process:
+
+* The integer operation will be dispatched to an integer Issue Queue.
+* When the integer source operands are ready, it will be issued into an integer execution pipeline to read the IRF.
+* When the integer op is in RR stage, an issue block signal will be sent to the floating point issue queue so that
+no entries get issued on the next cycle.
+* When the integer op is in EX stage, the appropriate operation is performed (convert or move).
+* In the same EX stage, a move operation is injected into the ISS stage of the floating point issue queue. A dependent
+floating point instruction may be woken up in this cycle.
+* When the integer op is in the WB stage, no writeback is performed on the IRF.  Instead the result of the
+integer operation is forwarded to the injected move operation (now in RR stage in the floating point pipe). A dependent
+floating point operation may issue in this cycle.
+* The injected move operations and dependent operations proceed through the EX and WB stages as normal.
+
+////
+* The move instruction will be dispatched to a integer Issue Queue.  When the integer source operand
+is ready, it will be issued into an integer execution pipeline to read the IRF.
+* Using an interface to one floating point Issue Queue, a signal will be sent to block the issue of instructions from that
+queue for one cycle.
+* During the blocked issue cycle, a move operation will be injected into the issue selection mux of the floating point
+Issue Queue (the selection mux has one dedicated input for these move injections).
+The destination PR index assigned to the move will be broadcast on the normal operand wakeup interface to wakeup
+any dependent floating point operations.
+* The move operation will go down the execution pipeline, intercept the value read from the IRF, and write to the FRF.
+////
+
+.Integer to Floating Point Timing
+image::fp_move_timing2.png[]
+
+<<<
+== System Unit
+The System Unit maintains the core CSRs and the System Issue Queue.  The System Issue Queue is used to serialize
+accesses to the CSRs, so that the CSRs do not need to be renamed.
+
+Some other units within the core are controlled to some degree by CSR values.  For example, the dynamic rounding
+mode used by the Floating Point unit depends on the __frm__ field of the __fcsr__ CSR register.  The System Unit
+will have interfaces to provide the necessary fields to other units within the core.  Due to routing delays
+and logic depth, it may be necessary for these paths to either be constrained as multi-cycle or pipelined in
+some manner.  Care must be taken to properly synchronize instructions with CSR updates, taking into account
+these latencies.
+
+=== System Issue Queue
+The System Issue Queue will buffer instructions which need to access system state such as CSRs.  Refer to
+<<Issue Queues>> for details on the workings of the issue queues.  The System issue queue is configured
+as FIFO-ordered, meaning that all system instructions will execute strictly in program order.  The issue queue
+exists mainly to allow non-system instructions to be re-ordered while system instructions are serialized.
+
+=== CSR Accesses
+The RISC-V ISA defines a few instructions to read and/or write the CSRs (listed below). These instructions
+all perform a similar set of operations (done atomically):
+
+* Read a CSR value, write it into an integer register
+* Read an integer register, and either write it to the CSR or use it as bit-mask to modify the CSR.
+
+These instructions will be identified at decode, and dispatched to the System Issue Queue.  Note that there are
+special cases where rd (the destination register) or rs1 (the source register) are encoded
+as x0.  If rd  == x0, then the CSR is not read and no side-effects from a CSR read will occur.
+If rs1 == x0, then the write to the CSR will not occur and no side-effects from a CSR write will occur.
+If both rd == x0 and rs1 == x0, then CSR is neither read nor written, and the instruction will be decoded as
+as NOP.
+
+These operations require both a read from the IRF and a write to the IRF.  To avoid adding extra ports
+on the IRF just for system instruction use, these CSR accesses will be injected into an integer
+execution pipeline.
+
+.CSR Access Instructions
+[options="header"]
+[cols="1,3"]
+|===
+|Instruction       | Description
+|CSRRW(I)          | Atomic Read/Write CSR
+|CSRRS(I)          | Atomic Read and Set Bits in CSR
+|CSRRC(I)          | Atomic Read and Clear Bits in CSR
+|===
+
+There are two different implementations of the System Pipeline due to requirement for support of SAINT AIA.
+
+* The first, original implementation if Pre-Panda DR and does not support external CSR accesses.
+* The second, newer implementation is Panda DR onwards and supports external CSR access for SAINT AIA.
+
+==== Original CSR Access Implementation
+
+The cycle timing diagram below illustrates the flow of CSR access instructions.  The flow is as follows:
+
+* When the oldest CSR access in the system issue queue is the next to retire in the ROB (gid == robRetirePtr) and the integer source (if required) is ready, an Issue block
+will be sent to the integer issue queue.
+* In RR stage, the CSR register will be read. A move operation will be injected into the integer execution pipe.
+* In TR (transmit) stage, the CSR register value will be forwarded to the injected op in RR stage. The injected
+op will read any necessary integer registers.
+* In EX stage, the integer register value will be forwarded to the CSR op, which will perform any necessary bit-masking.
+* In WB stage, the CSR register will be updated, and the injected op will write the original CSR value to the IRF.
+
+Updates to some CSRs require synchronizing with the instruction stream.  These operations will be decoded as needing
+to flush the pipeline after the CSR update occurs.  The System Unit will coordinate with the ROB to flush the
+pipeline and redirect to the instruction following the CSR access.
+
+.CSR Access Timing
+image::csr_timing.png[]
+
+Because the CSR read-modify-write sequence must be seen as atomic, the CSR accesses will not be pipelined if
+a CSR write is happening (meaning rs1 != x0). To also
+avoid extra bypassing logic, an older CSR access will writeback before a younger CSR access reads the CSR register.
+This means that the best-case latency for back-to-back CSR accesses if the first is a write is 4 cycles,
+where the writeback of one CSR access overlaps with the issue cycle of a younger CSR access.  The cycle timing diagram
+below illustrates this 4 cycle latency.
+
+.CSR Access Latency
+image::csr_latency.png[]
+
+[NOTE]
+As a future optimization, the hardware could check that the accesses are not to the same CSR and allow pipelining.
+However, care must be taken to consider aliases.  Where two different CSR addresses access the same physical
+register.
+
+==== CSR Accesses for Panda DR and later
+The implementation of CSR accesses was changed in the Panda release due to the requirement to support the new SAINT AIA IMSIC which is outside of the core. This meant that CSR accesses could be routed to the internal CSR registers or to CSR registers in another clock domain. It was also apparent that while the previous implementation made the operation atomic at an instruction level the CSR access between the System Pipe and the CSR register wasn't with Read and Write operations performed several cycles apart. The CSRFile block supports returning the previous data from a regster when writing the register which makes the CSRFile operation atomic. This was a requirement for the SAINT IMSIC implementation.
+
+The general sequence of operations to perform a CSR access (in atomic fashion) is as follows:
+
+* When the oldest CSR access in the system issue queue is the next to retire in the ROB (gid == robRetirePtr) and the integer source (if required) is ready, the instruction will issue.
+* Inject a PRF read operation into the ExPipe.
+* Wait for the PRF data to be transferred from the ExPipe.
+* Perform the CSR Access, both writing and reading in a single atomic operation.
+* Inject a PRF write operation into the ExPipe.
+* Transfer the CSR read data to the ExPipe.
+* System Pipe and ExPipe perform writeback at the same time, in the system pipe this might involve a shadow CSR access.
+* System Pipe signals ROB completion once any Shadow CSR operations are complete.
+* ExPipe broadcasts tag if required.
+
+.Panda CSR Access Timing
+[#img-panda-csr-access-timing]
+image::panda_csr_expipe_timing.png[]
+
+The <<#img-panda-csr-access-timing, CSR Access Timing diagram>> shows how the operation of the system pipe and the ExPipe are sequenced together. The system pipe has a number of pipe stages, we label these with the System pipe stage name and then equivilent ExPipe stage names:
+
+* ISS/<None> - System Pipe Issue stage
+* RIS/ISS - PRF Read Operation Issue stage
+* IRR/RR - Integer PRF Read Stage
+* REX/EX - Integer Read Execute Stage
+* COP/WB - CSR Operation Stage, write a CSR and read the previous value at the same time. Technically the ExPipe will perform writeback here but it is doing nothing as it was only reading the PRF.
+* WIS/ISS - PRF Write Operation Issue stage
+* TRR/RR - Transfer CSR value to the ExPipe
+* WEX/EX - PRF Write Operation Execute stage.
+* WB/WB - Integer pipeline writes PRF and broadcasts tag, System pipe performs Shadow CSR operation and signals ROB completion.
+
+Updates to some CSRs require synchronizing with the instruction stream. These operations will be decoded as needing to flush the pipeline after the CSR update occurs. The System Unit will coordinate with the ROB to flush the pipeline and redirect to the instruction following the CSR access.
+
+.Panda CSR Variable Access Latency
+[#img-panda-csr-access-latency]
+image::panda_csr_int_ext_latency.png[]
+
+Due to the different latency for accessing internal or external CSR registers the latency for accessing the register is variable, this is shown in the <<#img-panda-csr-access-timing,Figure above>>.
+
+* For internal operations, the CSR accesses will each complete in the same cycle, this means that all CSR operations will take 9-cycles from issue to completion.
+* In the cases of external CSR accesses, these figures become minimum latency values as the access time depends on factors like clock-domain crossing and retiming stages on buses.
+
+.Panda Back-To-Back CSR Accesses
+[#img-panda-csr-b2b-latency]
+image::panda_csr2csr_latency.png[]
+
+CSR operations are implemented so they are always atomic, only one operation is resident in the pipeline at any one time. This means that an operation must issue and run to completion (signalling completion to the ROB) before the next operation can issue. The timing of this is shown in the <<#img-panda-csr-b2b-latency, figure above>>. For internal operations involving a single read or write of the CSR register file we have an 9-cycle delay between issuing successive CSR operations.
+
+[NOTE]
+As a future optimization, the hardware could pipeline accesses:
+* If operations are to internal registers then they have fixed latency.
+* If operations are not Read-Modify-Write.
+* If an operation accesses a "safe" register with no read side-effects and where data cannot be lost, then reads may be speculatively issued.
+
+<<<
+== Exceptions
+When non-speculative exceptions or interrupts occur in the pipeline, multiple steps must be taken to adjust the
+architectural state of the machine and jump to the trap handler.
+
+.Steps to be taken on a general trap
+* Write the encoded cause to the appropriate __x__**cause** register
+* Write the virtual address of the instruction taking the trap to the appropriate __x__**epc** register
+* Write exception-specific information to the appropriate __x__**tval** register
+* The xPP field of *mstatus* is updated with the active privilege mode at time of trap
+* The xPIE field of *mstatus* is updated with the active interrupt-enable bit at time of trap
+
+<<<
+== Memory Management Unit (MMU)
+Description of {project-name} MMU can be found in:
+https://github.com/sifive/arch-specs/blob/master/core/mallard_mmu_mas.adoc[Mallard MMU MAS]
+
+<<<
+== Debug
+TODO: Fill in details or point to appropriate debug spec.
+
+<<<
+== Trace
+{project-name} supports hardware instruction trace capability.  The hart interfaces with an
+external trace encoder which generates output packets.
+
+The draft of the trace spec, which includes the hart-to-encoder interface, can be found
+here: https://github.com/riscv/riscv-trace-spec/blob/master/riscv-trace-spec.pdf
+
+<<<
+== Reset
+TODO: Fill in reset details here
+
+<<<
+== Chicken Bits
+The {project-name} core includes software-programmable CSRs to tune or defeature the core,
+colloquially referred to as chicken bits. The chicken bits are documented in the Object Model,
+and are not duplicated here to avoid having information out of date with the RTL.
